@@ -1,0 +1,473 @@
+{
+  "start": "-PT3H",
+  "end": "PT0H",
+  "periodOverride": "auto",
+  "widgets": [
+    {
+      "type": "text",
+      "x": 0,
+      "y": 0,
+      "width": 24,
+      "height": 1,
+      "properties": {
+        "markdown": "# 🎯 Genesys EventBridge Platform - Operations Dashboard\n**Environment**: Production | **OPCO**: ACME | **Region**: us-east-1 | **Pipelines**: 7 Event-Driven + 1 Batch (Mappers) | **Total Alarms**: 41"
+      }
+    },
+    {
+      "type": "alarm",
+      "x": 0,
+      "y": 1,
+      "width": 8,
+      "height": 6,
+      "properties": {
+        "title": "🚨 Transcription & Attributes Alarms",
+        "alarms": [
+          "arn:aws:cloudwatch:us-east-1:123456789012:alarm:prod-ACME-transcription-sessions-data-freshness",
+          "arn:aws:cloudwatch:us-east-1:123456789012:alarm:prod-ACME-transcription-utterances-data-freshness",
+          "arn:aws:cloudwatch:us-east-1:123456789012:alarm:prod-ACME-transcription-sessions-lambda-error-rate",
+          "arn:aws:cloudwatch:us-east-1:123456789012:alarm:prod-ACME-transcription-utterances-lambda-error-rate",
+          "arn:aws:cloudwatch:us-east-1:123456789012:alarm:prod-ACME-transcription-sessions-lambda-duration",
+          "arn:aws:cloudwatch:us-east-1:123456789012:alarm:prod-ACME-transcription-utterances-lambda-duration",
+          "arn:aws:cloudwatch:us-east-1:123456789012:alarm:prod-ACME-transcription-dlq-depth",
+          "arn:aws:cloudwatch:us-east-1:123456789012:alarm:prod-ACME_attributes_data_freshness",
+          "arn:aws:cloudwatch:us-east-1:123456789012:alarm:prod-ACME_attributes_lambda_error_rate",
+          "arn:aws:cloudwatch:us-east-1:123456789012:alarm:prod-ACME_attributes_lambda_error_percentage",
+          "arn:aws:cloudwatch:us-east-1:123456789012:alarm:prod-ACME_attributes_lambda_duration",
+          "arn:aws:cloudwatch:us-east-1:123456789012:alarm:prod-ACME_attributes_dlq_depth"
+        ]
+      }
+    },
+    {
+      "type": "alarm",
+      "x": 8,
+      "y": 1,
+      "width": 8,
+      "height": 6,
+      "properties": {
+        "title": "🚨 User/Customer/Flow Alarms",
+        "alarms": [
+          "arn:aws:cloudwatch:us-east-1:123456789012:alarm:prod-ACME_userend_data_freshness",
+          "arn:aws:cloudwatch:us-east-1:123456789012:alarm:prod-ACME_userend_lambda_error_rate",
+          "arn:aws:cloudwatch:us-east-1:123456789012:alarm:prod-ACME_userend_lambda_error_percentage",
+          "arn:aws:cloudwatch:us-east-1:123456789012:alarm:prod-ACME_userend_lambda_duration",
+          "arn:aws:cloudwatch:us-east-1:123456789012:alarm:prod-ACME_userend_dlq_depth",
+          "arn:aws:cloudwatch:us-east-1:123456789012:alarm:prod-ACME_customerend_data_freshness",
+          "arn:aws:cloudwatch:us-east-1:123456789012:alarm:prod-ACME_customerend_lambda_error_rate",
+          "arn:aws:cloudwatch:us-east-1:123456789012:alarm:prod-ACME_customerend_lambda_error_percentage",
+          "arn:aws:cloudwatch:us-east-1:123456789012:alarm:prod-ACME_customerend_lambda_duration",
+          "arn:aws:cloudwatch:us-east-1:123456789012:alarm:prod-ACME_customerend_dlq_depth",
+          "arn:aws:cloudwatch:us-east-1:123456789012:alarm:prod-ACME_flowend_data_freshness",
+          "arn:aws:cloudwatch:us-east-1:123456789012:alarm:prod-ACME_flowend_lambda_error_rate",
+          "arn:aws:cloudwatch:us-east-1:123456789012:alarm:prod-ACME_flowend_lambda_error_percentage",
+          "arn:aws:cloudwatch:us-east-1:123456789012:alarm:prod-ACME_flowend_lambda_duration",
+          "arn:aws:cloudwatch:us-east-1:123456789012:alarm:prod-ACME_flowend_dlq_depth",
+          "arn:aws:cloudwatch:us-east-1:123456789012:alarm:prod-ACME_flowoutcome_data_freshness",
+          "arn:aws:cloudwatch:us-east-1:123456789012:alarm:prod-ACME_flowoutcome_lambda_error_rate",
+          "arn:aws:cloudwatch:us-east-1:123456789012:alarm:prod-ACME_flowoutcome_lambda_error_percentage",
+          "arn:aws:cloudwatch:us-east-1:123456789012:alarm:prod-ACME_flowoutcome_lambda_duration",
+          "arn:aws:cloudwatch:us-east-1:123456789012:alarm:prod-ACME_flowoutcome_dlq_depth"
+        ]
+      }
+    },
+    {
+      "type": "alarm",
+      "x": 16,
+      "y": 1,
+      "width": 8,
+      "height": 6,
+      "properties": {
+        "title": "🚨 ACD Alarms",
+        "alarms": [
+          "arn:aws:cloudwatch:us-east-1:123456789012:alarm:prod-ACME_acdend_data_freshness",
+          "arn:aws:cloudwatch:us-east-1:123456789012:alarm:prod-ACME_acdend_lambda_error_rate",
+          "arn:aws:cloudwatch:us-east-1:123456789012:alarm:prod-ACME_acdend_lambda_error_percentage",
+          "arn:aws:cloudwatch:us-east-1:123456789012:alarm:prod-ACME_acdend_lambda_duration",
+          "arn:aws:cloudwatch:us-east-1:123456789012:alarm:prod-ACME_acdend_dlq_depth"
+        ]
+      }
+    },
+    {
+      "type": "text",
+      "x": 0,
+      "y": 7,
+      "width": 24,
+      "height": 1,
+      "properties": {
+        "markdown": "## 🕐 DATA FRESHNESS - ALL PIPELINES (Target: Under 30 Minutes)"
+      }
+    },
+    {
+      "type": "metric",
+      "x": 0,
+      "y": 8,
+      "width": 18,
+      "height": 6,
+      "properties": {
+        "metrics": [
+          [ "prod-ACME_TranscriptionSessionsPipeline", "DataAgeMinutes", "TableName", "transcription_sessions", "OPCO", "ACME", { "stat": "Average", "label": "Transcription Sessions" } ],
+          [ "prod-ACME_TranscriptionUtterancesPipeline", "DataAgeMinutes", "TableName", "transcription_utterances", "OPCO", "ACME", { "stat": "Average", "label": "Transcription Utterances" } ],
+          [ "prod-ACME_UserendPipeline", "DataAgeMinutes", "TableName", "userend", "OPCO", "ACME", { "stat": "Average", "label": "Userend" } ],
+          [ "prod-ACME_CustomerendPipeline", "DataAgeMinutes", "TableName", "customerend", "OPCO", "ACME", { "stat": "Average", "label": "Customerend" } ],
+          [ "prod-ACME_FlowendPipeline", "DataAgeMinutes", "TableName", "flowend", "OPCO", "ACME", { "stat": "Average", "label": "Flowend" } ],
+          [ "prod-ACME_FlowoutcomePipeline", "DataAgeMinutes", "TableName", "flowoutcome", "OPCO", "ACME", { "stat": "Average", "label": "Flowoutcome" } ],
+          [ "prod-ACME_AttributesPipeline", "DataAgeMinutes", "TableName", "attributes", "OPCO", "ACME", { "stat": "Average", "label": "Attributes" } ],
+          [ "prod-ACME_AcdendPipeline", "DataAgeMinutes", "TableName", "acdend", "OPCO", "ACME", { "stat": "Average", "label": "Acdend" } ]
+        ],
+        "view": "timeSeries",
+        "stacked": false,
+        "region": "us-east-1",
+        "title": "⏱️ Data Freshness Trend (Minutes Since Last Record)",
+        "period": 300,
+        "yAxis": {
+          "left": {
+            "min": 0,
+            "max": 60,
+            "label": "Minutes"
+          }
+        },
+        "annotations": {
+          "horizontal": [
+            {
+              "label": "CRITICAL: 30 min",
+              "value": 30,
+              "fill": "above",
+              "color": "#d62728"
+            },
+            {
+              "label": "HEALTHY",
+              "value": 0,
+              "color": "#2ca02c"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "type": "metric",
+      "x": 18,
+      "y": 8,
+      "width": 6,
+      "height": 6,
+      "properties": {
+        "metrics": [
+          [ "prod-ACME_TranscriptionSessionsPipeline", "DataAgeMinutes", "TableName", "transcription_sessions", "OPCO", "ACME", { "label": "Sessions" } ],
+          [ "prod-ACME_TranscriptionUtterancesPipeline", "DataAgeMinutes", "TableName", "transcription_utterances", "OPCO", "ACME", { "label": "Utterances" } ],
+          [ "prod-ACME_UserendPipeline", "DataAgeMinutes", "TableName", "userend", "OPCO", "ACME", { "label": "Userend" } ],
+          [ "prod-ACME_CustomerendPipeline", "DataAgeMinutes", "TableName", "customerend", "OPCO", "ACME", { "label": "Customerend" } ],
+          [ "prod-ACME_FlowendPipeline", "DataAgeMinutes", "TableName", "flowend", "OPCO", "ACME", { "label": "Flowend" } ],
+          [ "prod-ACME_FlowoutcomePipeline", "DataAgeMinutes", "TableName", "flowoutcome", "OPCO", "ACME", { "label": "Flowoutcome" } ],
+          [ "prod-ACME_AttributesPipeline", "DataAgeMinutes", "TableName", "attributes", "OPCO", "ACME", { "label": "Attributes" } ],
+          [ "prod-ACME_AcdendPipeline", "DataAgeMinutes", "TableName", "acdend", "OPCO", "ACME", { "label": "Acdend" } ]
+        ],
+        "view": "singleValue",
+        "region": "us-east-1",
+        "title": "🎯 Current Freshness",
+        "period": 300,
+        "stat": "Average"
+      }
+    },
+    {
+      "type": "text",
+      "x": 0,
+      "y": 14,
+      "width": 24,
+      "height": 1,
+      "properties": {
+        "markdown": "## 🔴 LAMBDA ERRORS & DLQ MONITORING (Target: Zero)"
+      }
+    },
+    {
+      "type": "metric",
+      "x": 0,
+      "y": 15,
+      "width": 12,
+      "height": 6,
+      "properties": {
+        "metrics": [
+          [ "AWS/Lambda", "Errors", "FunctionName", "prod-voice-transcription-sessions-transformation", { "stat": "Sum", "label": "Transcription Sessions" } ],
+          [ "AWS/Lambda", "Errors", "FunctionName", "prod-voice-transcription-utterances-transformation", { "stat": "Sum", "label": "Transcription Utterances" } ],
+          [ "AWS/Lambda", "Errors", "FunctionName", "prod-voice-userend-transformation", { "stat": "Sum", "label": "Userend" } ],
+          [ "AWS/Lambda", "Errors", "FunctionName", "prod-voice-customerend-transformation", { "stat": "Sum", "label": "Customerend" } ],
+          [ "AWS/Lambda", "Errors", "FunctionName", "prod-voice-flowend-transformation", { "stat": "Sum", "label": "Flowend" } ],
+          [ "AWS/Lambda", "Errors", "FunctionName", "prod-voice-flowoutcome-transformation", { "stat": "Sum", "label": "Flowoutcome" } ],
+          [ "AWS/Lambda", "Errors", "FunctionName", "prod-voice-attributes-transformation", { "stat": "Sum", "label": "Attributes" } ],
+          [ "AWS/Lambda", "Errors", "FunctionName", "prod-voice-acdend-transformation", { "stat": "Sum", "label": "Acdend" } ]
+        ],
+        "view": "timeSeries",
+        "stacked": false,
+        "region": "us-east-1",
+        "title": "❌ Lambda Errors (All Pipelines)",
+        "period": 300,
+        "yAxis": {
+          "left": {
+            "min": 0,
+            "label": "Error Count"
+          }
+        }
+      }
+    },
+    {
+      "type": "metric",
+      "x": 12,
+      "y": 15,
+      "width": 12,
+      "height": 6,
+      "properties": {
+        "metrics": [
+          [ "AWS/SQS", "ApproximateNumberOfMessagesVisible", "QueueName", "prod-voice-transcription-sessions-dlq", { "stat": "Maximum", "label": "Transcription Sessions" } ],
+          [ "AWS/SQS", "ApproximateNumberOfMessagesVisible", "QueueName", "prod-voice-transcription-utterances-dlq", { "stat": "Maximum", "label": "Transcription Utterances" } ],
+          [ "AWS/SQS", "ApproximateNumberOfMessagesVisible", "QueueName", "prod-voice-userend-dlq", { "stat": "Maximum", "label": "Userend" } ],
+          [ "AWS/SQS", "ApproximateNumberOfMessagesVisible", "QueueName", "prod-voice-customerend-dlq", { "stat": "Maximum", "label": "Customerend" } ],
+          [ "AWS/SQS", "ApproximateNumberOfMessagesVisible", "QueueName", "prod-voice-flowend-dlq", { "stat": "Maximum", "label": "Flowend" } ],
+          [ "AWS/SQS", "ApproximateNumberOfMessagesVisible", "QueueName", "prod-voice-flowoutcome-dlq", { "stat": "Maximum", "label": "Flowoutcome" } ],
+          [ "AWS/SQS", "ApproximateNumberOfMessagesVisible", "QueueName", "prod-voice-attributes-dlq", { "stat": "Maximum", "label": "Attributes" } ],
+          [ "AWS/SQS", "ApproximateNumberOfMessagesVisible", "QueueName", "prod-voice-acdend-dlq", { "stat": "Maximum", "label": "Acdend" } ]
+        ],
+        "view": "timeSeries",
+        "stacked": false,
+        "region": "us-east-1",
+        "title": "🚨 DLQ Message Depth (All Pipelines)",
+        "period": 300,
+        "yAxis": {
+          "left": {
+            "min": 0,
+            "label": "Messages in DLQ"
+          }
+        },
+        "annotations": {
+          "horizontal": [
+            {
+              "label": "WARNING: Messages in DLQ",
+              "value": 1,
+              "fill": "above",
+              "color": "#ff7f0e"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "type": "text",
+      "x": 0,
+      "y": 21,
+      "width": 24,
+      "height": 1,
+      "properties": {
+        "markdown": "## ⚡ LAMBDA PERFORMANCE METRICS"
+      }
+    },
+    {
+      "type": "metric",
+      "x": 0,
+      "y": 22,
+      "width": 12,
+      "height": 6,
+      "properties": {
+        "metrics": [
+          [ "AWS/Lambda", "Duration", "FunctionName", "prod-voice-transcription-sessions-transformation", { "stat": "Average", "label": "Transcription Sessions" } ],
+          [ "AWS/Lambda", "Duration", "FunctionName", "prod-voice-transcription-utterances-transformation", { "stat": "Average", "label": "Transcription Utterances" } ],
+          [ "AWS/Lambda", "Duration", "FunctionName", "prod-voice-userend-transformation", { "stat": "Average", "label": "Userend" } ],
+          [ "AWS/Lambda", "Duration", "FunctionName", "prod-voice-customerend-transformation", { "stat": "Average", "label": "Customerend" } ],
+          [ "AWS/Lambda", "Duration", "FunctionName", "prod-voice-flowend-transformation", { "stat": "Average", "label": "Flowend" } ],
+          [ "AWS/Lambda", "Duration", "FunctionName", "prod-voice-flowoutcome-transformation", { "stat": "Average", "label": "Flowoutcome" } ],
+          [ "AWS/Lambda", "Duration", "FunctionName", "prod-voice-attributes-transformation", { "stat": "Average", "label": "Attributes" } ],
+          [ "AWS/Lambda", "Duration", "FunctionName", "prod-voice-acdend-transformation", { "stat": "Average", "label": "Acdend" } ]
+        ],
+        "view": "timeSeries",
+        "stacked": false,
+        "region": "us-east-1",
+        "title": "⏱️ Lambda Execution Duration (Average)",
+        "period": 300,
+        "yAxis": {
+          "left": {
+            "min": 0,
+            "label": "Duration (ms)"
+          }
+        },
+        "annotations": {
+          "horizontal": [
+            {
+              "label": "WARNING: 48 seconds (80% timeout)",
+              "value": 48000,
+              "fill": "above",
+              "color": "#ff7f0e"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "type": "metric",
+      "x": 12,
+      "y": 22,
+      "width": 12,
+      "height": 6,
+      "properties": {
+        "metrics": [
+          [ "AWS/Lambda", "Invocations", "FunctionName", "prod-voice-transcription-sessions-transformation", { "stat": "Sum", "label": "Transcription Sessions" } ],
+          [ "AWS/Lambda", "Invocations", "FunctionName", "prod-voice-transcription-utterances-transformation", { "stat": "Sum", "label": "Transcription Utterances" } ],
+          [ "AWS/Lambda", "Invocations", "FunctionName", "prod-voice-userend-transformation", { "stat": "Sum", "label": "Userend" } ],
+          [ "AWS/Lambda", "Invocations", "FunctionName", "prod-voice-customerend-transformation", { "stat": "Sum", "label": "Customerend" } ],
+          [ "AWS/Lambda", "Invocations", "FunctionName", "prod-voice-flowend-transformation", { "stat": "Sum", "label": "Flowend" } ],
+          [ "AWS/Lambda", "Invocations", "FunctionName", "prod-voice-flowoutcome-transformation", { "stat": "Sum", "label": "Flowoutcome" } ],
+          [ "AWS/Lambda", "Invocations", "FunctionName", "prod-voice-attributes-transformation", { "stat": "Sum", "label": "Attributes" } ],
+          [ "AWS/Lambda", "Invocations", "FunctionName", "prod-voice-acdend-transformation", { "stat": "Sum", "label": "Acdend" } ]
+        ],
+        "view": "timeSeries",
+        "stacked": true,
+        "region": "us-east-1",
+        "title": "📊 Lambda Invocation Volume",
+        "period": 300,
+        "yAxis": {
+          "left": {
+            "min": 0,
+            "label": "Invocations"
+          }
+        }
+      }
+    },
+    {
+      "type": "text",
+      "x": 0,
+      "y": 28,
+      "width": 24,
+      "height": 1,
+      "properties": {
+        "markdown": "## 📦 FIREHOSE DELIVERY METRICS"
+      }
+    },
+    {
+      "type": "metric",
+      "x": 0,
+      "y": 29,
+      "width": 24,
+      "height": 6,
+      "properties": {
+        "metrics": [
+          [ "AWS/Firehose", "DeliveryToS3.Records", "DeliveryStreamName", "prod-voice-transcription-sessions-stream", { "stat": "Sum", "label": "Transcription Sessions" } ],
+          [ "AWS/Firehose", "DeliveryToS3.Records", "DeliveryStreamName", "prod-voice-transcription-utterances-stream", { "stat": "Sum", "label": "Transcription Utterances" } ],
+          [ "AWS/Firehose", "DeliveryToS3.Records", "DeliveryStreamName", "prod-voice-userend-stream", { "stat": "Sum", "label": "Userend" } ],
+          [ "AWS/Firehose", "DeliveryToS3.Records", "DeliveryStreamName", "prod-voice-customerend-stream", { "stat": "Sum", "label": "Customerend" } ],
+          [ "AWS/Firehose", "DeliveryToS3.Records", "DeliveryStreamName", "prod-voice-flowend-stream", { "stat": "Sum", "label": "Flowend" } ],
+          [ "AWS/Firehose", "DeliveryToS3.Records", "DeliveryStreamName", "prod-voice-flowoutcome-stream", { "stat": "Sum", "label": "Flowoutcome" } ],
+          [ "AWS/Firehose", "DeliveryToS3.Records", "DeliveryStreamName", "prod-voice-attributes-stream", { "stat": "Sum", "label": "Attributes" } ],
+          [ "AWS/Firehose", "DeliveryToS3.Records", "DeliveryStreamName", "prod-voice-acdend-stream", { "stat": "Sum", "label": "Acdend" } ]
+        ],
+        "view": "timeSeries",
+        "stacked": true,
+        "region": "us-east-1",
+        "title": "📈 Records Delivered to S3 (All Pipelines)",
+        "period": 300,
+        "yAxis": {
+          "left": {
+            "min": 0,
+            "label": "Records per 5min"
+          }
+        }
+      }
+    },
+    {
+      "type": "text",
+      "x": 0,
+      "y": 35,
+      "width": 24,
+      "height": 1,
+      "properties": {
+        "markdown": "## 🔧 MAPPERS PIPELINE (Glue Job - Batch Processing)"
+      }
+    },
+    {
+      "type": "metric",
+      "x": 0,
+      "y": 36,
+      "width": 12,
+      "height": 5,
+      "properties": {
+        "metrics": [
+          [ "AWS/Glue", "glue.driver.aggregate.numCompletedTasks", "JobName", "genesys_mappers_job", { "stat": "Sum", "label": "Completed Tasks" } ],
+          [ ".", "glue.driver.aggregate.numFailedTasks", ".", "genesys_mappers_job", { "stat": "Sum", "label": "Failed Tasks", "yAxis": "right", "color": "#d62728" } ]
+        ],
+        "view": "timeSeries",
+        "stacked": false,
+        "region": "us-east-1",
+        "title": "🔄 Glue Job Task Status (Users & Queues Mappers)",
+        "period": 3600,
+        "yAxis": {
+          "left": {
+            "label": "Completed Tasks"
+          },
+          "right": {
+            "label": "Failed Tasks"
+          }
+        }
+      }
+    },
+    {
+      "type": "metric",
+      "x": 12,
+      "y": 36,
+      "width": 12,
+      "height": 5,
+      "properties": {
+        "metrics": [
+          [ "AWS/Glue", "glue.driver.aggregate.elapsedTime", "JobName", "genesys_mappers_job", { "stat": "Average", "label": "Avg Execution Time" } ],
+          [ "AWS/Glue", "glue.driver.aggregate.elapsedTime", "JobName", "genesys_mappers_job", { "stat": "Maximum", "label": "Max Execution Time", "color": "#ff7f0e" } ]
+        ],
+        "view": "timeSeries",
+        "stacked": false,
+        "region": "us-east-1",
+        "title": "⏱️ Glue Job Execution Time (Milliseconds)",
+        "period": 3600,
+        "yAxis": {
+          "left": {
+            "min": 0,
+            "label": "Duration (ms)"
+          }
+        },
+        "annotations": {
+          "horizontal": [
+            {
+              "label": "Timeout: 30 minutes",
+              "value": 1800000,
+              "color": "#d62728"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "type": "text",
+      "x": 0,
+      "y": 41,
+      "width": 24,
+      "height": 1,
+      "properties": {
+        "markdown": "## 🔍 ERROR INVESTIGATION"
+      }
+    },
+    {
+      "type": "log",
+      "x": 0,
+      "y": 42,
+      "width": 24,
+      "height": 6,
+      "properties": {
+        "query": "SOURCE '/aws/lambda/genesys_voice_transcription_transformation_sessions'\n| SOURCE '/aws/lambda/genesys_voice_transcription_transformation_utterances'\n| SOURCE '/aws/lambda/genesys_voice_userend_transformation'\n| SOURCE '/aws/lambda/genesys_voice_customerend_transformation'\n| SOURCE '/aws/lambda/genesys_voice_flowend_transformation'\n| SOURCE '/aws/lambda/genesys_voice_flowoutcome_transformation'\n| SOURCE '/aws/lambda/genesys_voice_attributes_transformation'\n| SOURCE '/aws/lambda/genesys_voice_acdend_transformation'\n| fields @timestamp, @message, @logStream\n| filter @message like /ERROR/ or @message like /Exception/ or @message like /Failed/ or @message like /Error/\n| sort @timestamp desc\n| limit 50",
+        "region": "us-east-1",
+        "stacked": false,
+        "title": "🔍 Recent Errors Across All Lambda Functions (Last 50)",
+        "view": "table"
+      }
+    },
+    {
+      "type": "text",
+      "x": 0,
+      "y": 48,
+      "width": 24,
+      "height": 6,
+      "properties": {
+        "markdown": "---\n## 📝 OPERATIONAL REFERENCE GUIDE\n\n### ✅ Healthy System Indicators\n- All **41 alarms** in OK state (green)\n- Data freshness **under 30 minutes** for all pipelines\n- **Zero errors** in Lambda functions\n- Lambda duration **under 48 seconds** (80% of timeout)\n- **Zero messages** in all DLQs\n- Mappers Glue job completing successfully daily\n\n### 🔴 Critical Action Items\n\n| Issue | Threshold | Immediate Action |\n|-------|-----------|------------------|\n| **Data Freshness > 30 min** | CRITICAL | 1. Check EventBridge rule enabled<br>2. Verify Lambda execution logs<br>3. Check Firehose delivery stream<br>4. Verify S3 permissions and Lake Formation |\n| **Lambda Error Rate > 1%** | CRITICAL | 1. Check CloudWatch Logs for specific errors<br>2. Review DLQ messages for patterns<br>3. Verify event schema compatibility<br>4. Check S3 write permissions |\n| **DLQ Depth > 10** | CRITICAL | 1. Investigate failed event patterns<br>2. Check for schema changes<br>3. Review Lambda transformation logic<br>4. Consider reprocessing events |\n| **Lambda Duration > 48s** | WARNING | 1. Increase Lambda memory allocation<br>2. Review transformation code efficiency<br>3. Check Firehose response times |\n| **Glue Job Failures** | WARNING | 1. Check `/aws-glue/python-jobs/genesys_mappers_job` logs<br>2. Verify Genesys API credentials<br>3. Check network connectivity<br>4. Review S3 write permissions |\n\n### 📊 Pipeline Overview\n\n**Event-Driven Pipelines (Real-Time):**\n1. **Transcription** - Sessions & Utterances (9 alarms)\n2. **Userend** - User interaction end events (5 alarms)\n3. **Customerend** - Customer interaction end events (5 alarms)\n4. **Flowend** - IVR flow completion events (5 alarms)\n5. **Flowoutcome** - IVR flow outcome events (5 alarms)\n6. **Attributes** - Custom attributes with outage flags (5 alarms)\n7. **Acdend** - ACD queue interaction events (5 alarms)\n\n**Batch Pipeline (Scheduled):**\n8. **Mappers** - Users & Queues reference data (Glue job, daily at 6 AM UTC) (2 alarms)\n\n### 🔗 Quick AWS Console Links\n- [CloudFormation Stacks](https://console.aws.amazon.com/cloudformation/home?region=us-east-1#/stacks)\n- [Lambda Functions](https://console.aws.amazon.com/lambda/home?region=us-east-1#/functions)\n- [CloudWatch Alarms](https://console.aws.amazon.com/cloudwatch/home?region=us-east-1#alarmsV2:)\n- [EventBridge Rules](https://console.aws.amazon.com/events/home?region=us-east-1#/rules)\n- [Firehose Delivery Streams](https://console.aws.amazon.com/firehose/home?region=us-east-1#/)\n- [S3 Bucket: genesys-streaming-lakehouse](https://s3.console.aws.amazon.com/s3/buckets/genesys-streaming-lakehouse)\n- [Athena Query Console](https://console.aws.amazon.com/athena/home?region=us-east-1)\n- [Glue Jobs](https://console.aws.amazon.com/glue/home?region=us-east-1#/v2/etl-configuration/jobs)\n\n### 🛠️ Common Troubleshooting Commands\n\n```bash\n# List all alarms and their states\naws cloudwatch describe-alarms --region us-east-1 --query 'MetricAlarms[?starts_with(AlarmName, `prod-ACME`)].{Name:AlarmName,State:StateValue}' --output table\n\n# Check Lambda errors in last hour\naws cloudwatch get-metric-statistics --namespace AWS/Lambda --metric-name Errors --dimensions Name=FunctionName,Value=prod-voice-attributes-transformation --start-time $(date -u -d '1 hour ago' +%Y-%m-%dT%H:%M:%S) --end-time $(date -u +%Y-%m-%dT%H:%M:%S) --period 300 --statistics Sum\n\n# Check DLQ depth\naws sqs get-queue-attributes --queue-url https://sqs.us-east-1.amazonaws.com/123456789012/prod-voice-attributes-dlq --attribute-names ApproximateNumberOfMessages\n\n# Manually trigger Glue mappers job\naws glue start-job-run --job-name genesys_mappers_job\n\n# Query Athena for latest data\naws athena start-query-execution --query-string \"SELECT MAX(dt) FROM \\\"genesys_streaming_lakehouse_curated\\\".\\\"voice_attributes\\\"\" --result-configuration OutputLocation=s3://aws-athena-query-results-123456789012-us-east-1/\n```\n\n### 📞 Escalation Path\n1. **Level 1**: Check this dashboard for specific pipeline/alarm in alarm state\n2. **Level 2**: Review CloudWatch Logs for the failing component\n3. **Level 3**: Check DLQ messages for event schema issues\n4. **Level 4**: Review recent CloudFormation stack updates\n5. **Level 5**: Verify EventBridge partner bus connectivity (Genesys support)\n6. **Level 6**: Engage AWS Support for infrastructure issues\n\n### 📈 Monitoring Cadence\n- **Real-time**: This dashboard (auto-refresh every 5 minutes)\n- **Daily**: Review alarm history and data freshness trends\n- **Weekly**: Analyze Lambda performance and optimize if needed\n- **Monthly**: Review DLQ patterns and reprocess failed events\n- **Quarterly**: Cost optimization review (Lambda, Glue, S3 storage)"
+      }
+    }
+  ]
+}

@@ -1,0 +1,1215 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Genesys Voice CUSTOMER.END Data Pipeline Infrastructure'
+
+# ==========================================
+# Parameters
+# ==========================================
+Parameters:
+  Environment:
+    Type: String
+    Default: prod
+    Description: Environment name
+    AllowedValues:
+      - dev
+      - staging
+      - prod
+
+  OPCO:
+    Type: String
+    Default: ACME
+    Description: Operating company code
+
+  OPCOLower:
+    Type: String
+    Default: acme
+    Description: Operating company code in lowercase
+
+  ProjectName:
+    Type: String
+    Default: genesys_reports
+    Description: Project name for resource naming
+
+  LambdaCodeS3Bucket:
+    Type: String
+    Description: >-
+      REQUIRED -- S3 bucket containing this pipeline's Lambda deployment package.
+      No default: this is an account-specific bucket you must create/own, not a shared or public one.
+    AllowedPattern: '.+'
+    ConstraintDescription: 'must be a non-empty S3 bucket name you control'
+
+  LambdaCodeS3Key:
+    Type: String
+    Default: genesys_voice_interactions/prod/customerend/voice_customer_end_transformation_v1.0.1.zip
+    Description: S3 key for Lambda code zip file
+
+  S3BasePrefix:
+    Type: String
+    Default: genesys_voice_interactions
+    Description: Base S3 prefix for data storage
+
+  EventsName:
+    Type: String
+    Default: voice_customer_end
+    Description: EventBridge rule name
+
+  GenesysEventBusName:
+    Type: String
+    Default: aws.partner/genesys.com/cloud/00000000-0000-0000-0000-000000000000/genesys_acme
+    Description: Genesys partner event bus name
+
+  DataBucketName:
+    Type: String
+    Description: >-
+      REQUIRED -- S3 bucket for this pipeline's data storage (raw/transformed/error prefixes).
+      No default: this is an account-specific bucket you must create/own, not a shared or public one.
+    AllowedPattern: '.+'
+    ConstraintDescription: 'must be a non-empty S3 bucket name you control'
+
+  GlueDatabaseName:
+    Type: String
+    Default: genesys_streaming_lakehouse
+    Description: Glue database name (raw ingestion — the deduplicated curated view for this table lives in the separate genesys_streaming_lakehouse_curated database, see sql/views/)
+
+  CreateGlueDatabase:
+    Type: String
+    Default: 'false'
+    Description: Whether to create the Glue database (set to true if it doesn't exist)
+    AllowedValues:
+      - 'true'
+      - 'false'
+
+  DataFreshnessThresholdMinutes:
+    Type: Number
+    Description: Maximum age of data in minutes before alarming
+    Default: 30
+
+  DataFreshnessAlarmPeriodSeconds:
+    Type: Number
+    Description: Period in seconds for data freshness metric
+    Default: 300
+
+  DataFreshnessAlarmEvaluationPeriods:
+    Type: Number
+    Description: Number of evaluation periods for data freshness alarm
+    Default: 4
+
+  LambdaErrorRateThreshold:
+    Type: Number
+    Description: Lambda error rate threshold percentage (0-100)
+    Default: 1
+    MinValue: 0
+    MaxValue: 100
+
+  SNSAlertTopicArn:
+    Type: String
+    Description: SNS Topic ARN for alert notifications
+    Default: arn:aws:sns:us-east-1:123456789012:genesys-pipeline-alerts
+
+  SharedAlarmFormatterTopicArn:
+    Type: String
+    Description: ARN of shared alarm formatter SNS topic (leave empty to create new)
+    Default: ''
+
+  DataLakeAdminRoleArn:
+    Type: String
+    Description: IAM role ARN granted DESCRIBE/SELECT on the staging table (e.g. a platform admin role)
+    Default: 'arn:aws:iam::123456789012:role/YOUR-LAKE-FORMATION-ADMIN-ROLE'
+
+  DataLakeWorkloadRoleArn:
+    Type: String
+    Description: IAM role ARN granted DESCRIBE/SELECT on the staging table (e.g. an analytics workload role)
+    Default: 'arn:aws:iam::123456789012:role/YOUR-LAKE-FORMATION-WORKLOAD-ROLE'
+
+  DLQKmsKeyArn:
+    Type: String
+    Description: >-
+      Optional customer-managed KMS key ARN for the dead-letter queue's server-side encryption.
+      Leave empty to use SQS-managed encryption (SSE-SQS, AWS-owned key) instead -- enabled by
+      default below.
+    Default: ''
+
+Conditions:
+  UseCustomerManagedKmsForDLQ: !Not [!Equals [!Ref DLQKmsKeyArn, '']]
+  ShouldCreateGlueDatabase: !Equals [!Ref CreateGlueDatabase, 'true']
+  CreateAlarmFormatter: !Equals [!Ref SharedAlarmFormatterTopicArn, '']
+
+# ==========================================
+# Resources
+# ==========================================
+Resources:
+  # ============================================================================
+  # SQS Dead-Letter Queue
+  # ============================================================================
+  EventBridgeDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${Environment}-${EventsName}-dlq'
+      MessageRetentionPeriod: 345600  # 4 days
+      VisibilityTimeout: 300  # 5 minutes
+      SqsManagedSseEnabled: !If [UseCustomerManagedKmsForDLQ, !Ref 'AWS::NoValue', true]
+      KmsMasterKeyId: !If [UseCustomerManagedKmsForDLQ, !Ref DLQKmsKeyArn, !Ref 'AWS::NoValue']
+      Tags:
+        - Key: env
+          Value: !Ref Environment
+        - Key: opco
+          Value: !Ref OPCO
+        - Key: project
+          Value: !Ref ProjectName
+
+  DLQPolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues:
+        - !Ref EventBridgeDLQ
+      PolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sqs:SendMessage
+            Resource: !GetAtt EventBridgeDLQ.Arn
+
+  # ============================================================================
+  # Lambda Execution Role
+  # ============================================================================
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${Environment}_${EventsName}_transformation'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: CloudWatchLogsAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                  - logs:DescribeLogStreams
+                Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${Environment}_${EventsName}_transformation:*'
+      Tags:
+        - Key: env
+          Value: !Ref Environment
+        - Key: opco
+          Value: !Ref OPCO
+        - Key: project
+          Value: !Ref ProjectName
+
+  # ============================================================================
+  # Lambda Function
+  # ============================================================================
+  TransformationLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${Environment}_${EventsName}_transformation'
+      Description: Transform Genesys customer end events for Firehose ingestion
+      Runtime: python3.13
+      Handler: lambda_function.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Code:
+        S3Bucket: !Ref LambdaCodeS3Bucket
+        S3Key: !Ref LambdaCodeS3Key
+      MemorySize: 128
+      Timeout: 30
+      #ReservedConcurrentExecutions: 8
+      Environment:
+        Variables:
+          OPCO: !Ref OPCO
+          ENVIRONMENT: !Ref Environment
+          ENABLE_DEBUG: '0'
+      TracingConfig:
+        Mode: Active
+      Tags:
+        - Key: env
+          Value: !Ref Environment
+        - Key: opco
+          Value: !Ref OPCO
+        - Key: project
+          Value: !Ref ProjectName
+
+  # Lambda Alias
+  LambdaAliasStable:
+    Type: AWS::Lambda::Alias
+    Properties:
+      FunctionName: !Ref TransformationLambda
+      FunctionVersion: $LATEST
+      Name: stable
+      Description: Stable version for Firehose
+
+  # Lambda Log Group (explicit creation for retention)
+  LambdaLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${Environment}_${EventsName}_transformation'
+      RetentionInDays: 30
+
+  # Lambda Invoke Permission for Firehose
+  LambdaInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref TransformationLambda
+      Action: lambda:InvokeFunction
+      Principal: firehose.amazonaws.com
+      SourceArn: !GetAtt FirehoseDeliveryStream.Arn
+
+  # ============================================================================
+  # Firehose Service Role
+  # ============================================================================
+  FirehoseRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub 'KinesisFirehoseServiceRole-${Environment}-${EventsName}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: firehose.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                sts:ExternalId: !Ref AWS::AccountId
+      Policies:
+        - PolicyName: S3Access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:AbortMultipartUpload
+                  - s3:GetBucketLocation
+                  - s3:GetObject
+                  - s3:ListBucket
+                  - s3:ListBucketMultipartUploads
+                  - s3:PutObject
+                Resource:
+                  - !Sub 'arn:aws:s3:::${DataBucketName}'
+                  - !Sub 'arn:aws:s3:::${DataBucketName}/*'
+        - PolicyName: LambdaInvoke
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - lambda:InvokeFunction
+                  - lambda:GetFunctionConfiguration
+                Resource:
+                  - !GetAtt TransformationLambda.Arn
+                  - !Sub '${TransformationLambda.Arn}:*'
+        - PolicyName: GlueAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - glue:GetTable
+                  - glue:GetTableVersion
+                  - glue:GetTableVersions
+                  - glue:GetDatabase
+                Resource:
+                  - !Sub 'arn:aws:glue:${AWS::Region}:${AWS::AccountId}:catalog'
+                  - !Sub 'arn:aws:glue:${AWS::Region}:${AWS::AccountId}:database/${GlueDatabaseName}'
+                  - !Sub 'arn:aws:glue:${AWS::Region}:${AWS::AccountId}:table/${GlueDatabaseName}/${EventsName}'
+        - PolicyName: CloudWatchLogs
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:PutLogEvents
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/kinesisfirehose/*'
+      Tags:
+        - Key: env
+          Value: !Ref Environment
+        - Key: opco
+          Value: !Ref OPCO
+        - Key: project
+          Value: !Ref ProjectName
+
+  # ============================================================================
+  # Glue Database (Conditional)
+  # ============================================================================
+  GlueDatabase:
+    Type: AWS::Glue::Database
+    Condition: ShouldCreateGlueDatabase
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseInput:
+        Name: !Ref GlueDatabaseName
+        Description: Staging for Genesys EventBridge events (not shared)
+
+  # ============================================================================
+  # Glue Table
+  # ============================================================================
+  GlueTable:
+    Type: AWS::Glue::Table
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseName: !Ref GlueDatabaseName
+      TableInput:
+        Name: !Ref EventsName
+        Description: Genesys voice interaction customer end - staging table with full event history
+        TableType: EXTERNAL_TABLE
+        Parameters:
+          classification: parquet
+          parquet.compression: SNAPPY
+          projection.enabled: 'true'
+          projection.opco.type: enum
+          projection.opco.values: ACME
+          projection.dt.type: date
+          projection.dt.range: '2024-01-01,NOW'
+          projection.dt.format: yyyy-MM-dd
+          storage.location.template: !Sub 's3://${DataBucketName}/genesys_voice_interactions/${Environment}/customerend/transformed/opco=${!opco}/dt=${!dt}/'
+        StorageDescriptor:
+          Location: !Sub 's3://${DataBucketName}/genesys_voice_interactions/${Environment}/customerend/transformed/'
+          InputFormat: org.apache.hadoop.hive.ql.io.parquet.MapredParquetInputFormat
+          OutputFormat: org.apache.hadoop.hive.ql.io.parquet.MapredParquetOutputFormat
+          SerdeInfo:
+            SerializationLibrary: org.apache.hadoop.hive.ql.io.parquet.serde.ParquetHiveSerDe
+          Columns:
+            # Metadata
+            - Name: event_id
+              Type: string
+              Comment: Unique event identifier from EventBridge
+            - Name: event_time
+              Type: string
+              Comment: Event occurrence time (ISO 8601)
+            - Name: ingest_time
+              Type: string
+              Comment: S3 write time from Firehose (ISO 8601)
+            - Name: conversation_id
+              Type: string
+              Comment: Conversation identifier
+            - Name: interaction_id
+              Type: string
+              Comment: Interaction identifier (legacy)
+            - Name: participant_id
+              Type: string
+              Comment: Participant identifier
+            # EventBridge envelope
+            - Name: eb_version
+              Type: string
+              Comment: EventBridge event version
+            - Name: eb_account
+              Type: string
+              Comment: AWS Account ID
+            - Name: eb_region
+              Type: string
+              Comment: AWS Region
+            - Name: eb_source
+              Type: string
+              Comment: Event source
+            - Name: eb_detail_type
+              Type: string
+              Comment: EventBridge detail type
+            - Name: eb_time
+              Type: string
+              Comment: EventBridge event time (ISO 8601)
+            - Name: topic_name
+              Type: string
+              Comment: Genesys topic name
+            - Name: topic_version
+              Type: string
+              Comment: Genesys topic version
+            - Name: correlation_id
+              Type: string
+              Comment: Genesys correlation identifier
+            - Name: genesys_timestamp
+              Type: string
+              Comment: Genesys event timestamp (ISO 8601)
+            - Name: genesys_event_time
+              Type: bigint
+              Comment: Genesys event time in epoch milliseconds
+            # Core Event Data
+            - Name: session_id
+              Type: string
+              Comment: "Session identifier"
+            - Name: disconnect_type
+              Type: string
+              Comment: "Disconnect reason: ENDPOINT, ERROR, PEER, etc."
+            - Name: media_type
+              Type: string
+              Comment: "Always VOICE for this table"
+            - Name: provider
+              Type: string
+              Comment: "Provider (e.g., Edge)"
+            - Name: direction
+              Type: string
+              Comment: "Call direction: INBOUND or OUTBOUND"
+            - Name: ani
+              Type: string
+              Comment: "Caller phone number (format: tel:+...)"
+            - Name: dnis
+              Type: string
+              Comment: "Dialed number (format: tel:+...)"
+            - Name: interacting_duration_ms
+              Type: bigint
+              Comment: "Duration of interaction in milliseconds"
+            # ===== Optional Fields (NULLABLE) =====
+            - Name: external_contact_id
+              Type: string
+              Comment: "External contact identifier"
+            - Name: conversation_external_contact_ids
+              Type: array<string>
+              Comment: "External contact identifiers (present on nearly every conversation, illustrative)"
+            # ===== Raw Event (Keep full event for flexibility) =====
+            - Name: raw_event
+              Type: string
+              Comment: "Complete raw JSON event"
+        PartitionKeys:
+          - Name: opco
+            Type: string
+            Comment: Operating company code
+          - Name: dt
+            Type: string
+            Comment: Partition date (YYYY-MM-DD)
+
+  # ============================================================================
+  # Firehose Delivery Stream
+  # ============================================================================
+  # Firehose Log Group (explicit creation for retention)
+  FirehoseLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/kinesisfirehose/${Environment}-${EventsName}"
+      RetentionInDays: 14
+
+  # Firehose Delivery Stream
+  FirehoseDeliveryStream:
+    Type: AWS::KinesisFirehose::DeliveryStream
+    DependsOn:
+      - TransformationLambda
+      - LambdaAliasStable
+      - GlueTable
+      - LakeFormationPermsOnStagingTable
+      - FirehoseRole
+      - FirehoseLogGroup
+    Properties:
+      DeliveryStreamName: !Sub '${Environment}-${EventsName}'
+      DeliveryStreamType: DirectPut
+      ExtendedS3DestinationConfiguration:
+        BucketARN: !Sub 'arn:aws:s3:::${DataBucketName}'
+        RoleARN: !GetAtt FirehoseRole.Arn
+        Prefix: !Sub "${S3BasePrefix}/${Environment}/customerend/transformed/opco=!{partitionKeyFromQuery:opco}/dt=!{partitionKeyFromQuery:dt}/"
+        ErrorOutputPrefix: !Sub "${S3BasePrefix}/${Environment}/customerend/errors/!{firehose:error-output-type}/opco=${OPCO}/dt=!{timestamp:yyyy-MM-dd}/"
+        BufferingHints:
+          SizeInMBs: 128
+          IntervalInSeconds: 300
+        CompressionFormat: UNCOMPRESSED  # Parquet is already compressed
+        DynamicPartitioningConfiguration:
+          Enabled: true
+          RetryOptions:
+            DurationInSeconds: 300
+        ProcessingConfiguration:
+          Enabled: true
+          Processors:
+            - Type: Lambda
+              Parameters:
+                - ParameterName: LambdaArn
+                  ParameterValue: !Ref LambdaAliasStable
+                - ParameterName: BufferSizeInMBs
+                  ParameterValue: '1'
+                - ParameterName: BufferIntervalInSeconds
+                  ParameterValue: '60'
+            - Type: MetadataExtraction
+              Parameters:
+                - ParameterName: MetadataExtractionQuery
+                  ParameterValue: '{opco:.opco,dt:.dt}'
+                - ParameterName: JsonParsingEngine
+                  ParameterValue: JQ-1.6
+        DataFormatConversionConfiguration:
+          SchemaConfiguration:
+            DatabaseName: !Ref GlueDatabaseName
+            TableName: !Ref EventsName
+            Region: !Ref AWS::Region
+            RoleARN: !GetAtt FirehoseRole.Arn
+          InputFormatConfiguration:
+            Deserializer:
+              OpenXJsonSerDe: {}
+          OutputFormatConfiguration:
+            Serializer:
+              ParquetSerDe:
+                Compression: SNAPPY
+          Enabled: true
+        S3BackupMode: Enabled
+        S3BackupConfiguration:
+          BucketARN: !Sub 'arn:aws:s3:::${DataBucketName}'
+          RoleARN: !GetAtt FirehoseRole.Arn
+          Prefix: !Sub "${S3BasePrefix}/${Environment}/customerend/raw/opco=${OPCO}/dt=!{timestamp:yyyy-MM-dd}/"
+          ErrorOutputPrefix: !Sub "${S3BasePrefix}/${Environment}/customerend/raw-errors/!{firehose:error-output-type}/opco=${OPCO}/dt=!{timestamp:yyyy-MM-dd}/"
+          BufferingHints:
+            SizeInMBs: 5
+            IntervalInSeconds: 300
+          CompressionFormat: GZIP
+        CloudWatchLoggingOptions:
+          Enabled: true
+          LogGroupName: !Ref FirehoseLogGroup
+          LogStreamName: S3Delivery
+      Tags:
+        - Key: env
+          Value: !Ref Environment
+        - Key: opco
+          Value: !Ref OPCO
+        - Key: project
+          Value: !Ref ProjectName
+
+
+  # ============================================================================
+  # IAM Role for EventBridge to invoke Firehose
+  # ============================================================================
+  EventBridgeFirehoseRole:
+    Type: AWS::IAM::Role
+    DependsOn: FirehoseDeliveryStream
+    Properties:
+      RoleName: !Sub "EventBridge_Invoke_Firehose_${Environment}-${EventsName}"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: EventBridgeFirehosePolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: ActionsForFirehose
+                Effect: Allow
+                Action:
+                  - firehose:PutRecord
+                  - firehose:PutRecordBatch
+                Resource: !GetAtt FirehoseDeliveryStream.Arn
+                #Resource: !Sub "arn:aws:firehose:${AWS::Region}:${AWS::AccountId}:deliverystream/${Environment}-${EventsName}"
+      Tags:
+        - Key: env
+          Value: !Ref Environment
+        - Key: opco
+          Value: !Ref OPCO
+        - Key: project
+          Value: !Ref ProjectName
+
+  # ============================================================================
+  # EventBridge Rule
+  # ============================================================================
+  EventBridgeRule:
+    Type: AWS::Events::Rule
+    DependsOn: [EventBridgeFirehoseRole, EventBridgeDLQ]
+    Properties:
+      Name: !Sub "${Environment}-${EventsName}"
+      Description: "Genesys voice interactions customer end events to Firehose"
+      EventBusName: !Ref GenesysEventBusName
+      EventPattern:
+        source:
+          - prefix: "aws.partner/genesys.com"
+        detail-type:
+          - "v2.detail.events.conversation.{id}.customer.end"
+        detail:
+          eventBody:
+            mediaType:
+              - "VOICE"
+      State: ENABLED
+      Targets:
+        - Id: !Sub "${Environment}-${EventsName}-firehose-target"
+          Arn: !GetAtt FirehoseDeliveryStream.Arn
+          RoleArn: !GetAtt EventBridgeFirehoseRole.Arn
+          DeadLetterConfig:
+            Arn: !GetAtt EventBridgeDLQ.Arn
+      Tags:
+        - Key: env
+          Value: !Ref Environment
+        - Key: opco
+          Value: !Ref OPCO
+        - Key: project
+          Value: !Ref ProjectName
+
+  # EventBridge Archive for replay capability
+  EventBridgeArchive:
+    Type: AWS::Events::Archive
+    Properties:
+      ArchiveName: !Sub ${Environment}-${EventsName}-archive
+      Description: !Sub Genesys voice customer.end events archive for ${Environment}
+        - enables transformation replays
+      SourceArn: !Sub arn:aws:events:${AWS::Region}:${AWS::AccountId}:event-bus/${GenesysEventBusName}
+      EventPattern:
+        source:
+          - prefix: aws.partner/genesys.com
+        detail-type:
+          - "v2.detail.events.conversation.{id}.customer.end"
+        detail:
+          eventBody:
+            mediaType:
+              - "VOICE"
+      RetentionDays: 90
+
+  # ============================================================================
+  # Lake Formation Permissions for Kinesis Firehose Role
+  # ============================================================================
+  LakeFormationPermsOnStagingDB:
+    Type: AWS::LakeFormation::Permissions
+    DependsOn: [GlueTable, FirehoseRole]
+    Properties:
+      DataLakePrincipal:
+        DataLakePrincipalIdentifier: !GetAtt FirehoseRole.Arn
+      Permissions:
+        - DESCRIBE
+      Resource:
+        DatabaseResource:
+          CatalogId: !Ref AWS::AccountId
+          Name: !Ref GlueDatabaseName
+
+  LakeFormationPermsOnStagingTable:
+    Type: AWS::LakeFormation::Permissions
+    DependsOn: LakeFormationPermsOnStagingDB
+    Properties:
+      DataLakePrincipal:
+        DataLakePrincipalIdentifier: !GetAtt FirehoseRole.Arn
+      Permissions:
+        - DESCRIBE
+        - SELECT
+      Resource:
+       TableResource:
+          CatalogId: !Ref AWS::AccountId
+          DatabaseName: !Ref GlueDatabaseName
+          Name: !Ref GlueTable
+
+  # ============================================================================
+  # Lake Formation Permissions for additional roles/users
+  # ============================================================================
+  LakeFormationAdditionalAdminAccess:
+    Type: AWS::LakeFormation::Permissions
+    DependsOn: [GlueTable, LakeFormationPermsOnStagingDB]
+    Properties:
+      DataLakePrincipal:
+        DataLakePrincipalIdentifier: !Ref DataLakeAdminRoleArn
+      Permissions:
+        - DESCRIBE
+        - SELECT
+      Resource:
+       TableResource:
+          CatalogId: !Ref AWS::AccountId
+          DatabaseName: !Ref GlueDatabaseName
+          Name: !Ref GlueTable
+
+  LakeFormationAdditionalWorkloadAccess:
+    Type: AWS::LakeFormation::Permissions
+    DependsOn: [GlueTable, LakeFormationPermsOnStagingDB]
+    Properties:
+      DataLakePrincipal:
+        DataLakePrincipalIdentifier: !Ref DataLakeWorkloadRoleArn
+      Permissions:
+        - DESCRIBE
+        - SELECT
+      Resource:
+       TableResource:
+          CatalogId: !Ref AWS::AccountId
+          DatabaseName: !Ref GlueDatabaseName
+          Name: !Ref GlueTable
+
+  # ============================================================================
+  # CloudWatch Alarms for Monitoring
+  # ============================================================================
+
+  # DLQ Depth Alarm
+  DLQDepthAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${Environment}-${OPCO}_customerend_dlq_depth'
+      AlarmDescription: 'Dead Letter Queue has unprocessed failed events'
+      ActionsEnabled: true
+      AlarmActions:
+        - !If [CreateAlarmFormatter, !Ref SNSAlertTopicArn, !Ref SharedAlarmFormatterTopicArn]
+      OKActions:
+        - !If [CreateAlarmFormatter, !Ref SNSAlertTopicArn, !Ref SharedAlarmFormatterTopicArn]
+      MetricName: ApproximateNumberOfMessagesVisible
+      Namespace: AWS/SQS
+      Statistic: Maximum
+      Dimensions:
+        - Name: QueueName
+          Value: !Sub '${Environment}-${EventsName}-dlq'
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 10
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: OPCO
+          Value: !Ref OPCO
+        - Key: Severity
+          Value: High
+
+  # Lambda Error Rate Alarm
+  LambdaErrorRateAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${Environment}-${OPCO}_customerend_lambda_error_rate'
+      AlarmDescription: 'Lambda error rate exceeds threshold'
+      ActionsEnabled: true
+      AlarmActions:
+        - !If [CreateAlarmFormatter, !Ref SNSAlertTopicArn, !Ref SharedAlarmFormatterTopicArn]
+      OKActions:
+        - !If [CreateAlarmFormatter, !Ref SNSAlertTopicArn, !Ref SharedAlarmFormatterTopicArn]
+      MetricName: Errors
+      Namespace: AWS/Lambda
+      Statistic: Sum
+      Dimensions:
+        - Name: FunctionName
+          Value: !Sub '${Environment}_${EventsName}_transformation'
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 5
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: OPCO
+          Value: !Ref OPCO
+        - Key: Severity
+          Value: High
+
+  # Lambda Error Percentage Alarm
+  LambdaErrorPercentageAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${Environment}-${OPCO}_customerend_lambda_error_percentage'
+      AlarmDescription: !Sub 'Lambda error rate exceeds ${LambdaErrorRateThreshold}%'
+      ActionsEnabled: true
+      AlarmActions:
+        - !If [CreateAlarmFormatter, !Ref SNSAlertTopicArn, !Ref SharedAlarmFormatterTopicArn]
+      OKActions:
+        - !If [CreateAlarmFormatter, !Ref SNSAlertTopicArn, !Ref SharedAlarmFormatterTopicArn]
+      Metrics:
+        - Id: error_rate
+          Expression: (errors / invocations) * 100
+          Label: Error Rate Percentage
+        - Id: errors
+          MetricStat:
+            Metric:
+              Namespace: AWS/Lambda
+              MetricName: Errors
+              Dimensions:
+                - Name: FunctionName
+                  Value: !Sub '${Environment}_${EventsName}_transformation'
+            Period: 300
+            Stat: Sum
+          ReturnData: false
+        - Id: invocations
+          MetricStat:
+            Metric:
+              Namespace: AWS/Lambda
+              MetricName: Invocations
+              Dimensions:
+                - Name: FunctionName
+                  Value: !Sub '${Environment}_${EventsName}_transformation'
+            Period: 300
+            Stat: Sum
+          ReturnData: false
+      EvaluationPeriods: 2
+      Threshold: !Ref LambdaErrorRateThreshold
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: OPCO
+          Value: !Ref OPCO
+        - Key: Severity
+          Value: Critical
+
+  # Lambda Duration Alarm
+  LambdaDurationAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${Environment}-${OPCO}_customerend_lambda_duration'
+      AlarmDescription: 'Lambda approaching timeout'
+      ActionsEnabled: true
+      AlarmActions:
+        - !If [CreateAlarmFormatter, !Ref SNSAlertTopicArn, !Ref SharedAlarmFormatterTopicArn]
+      OKActions:
+        - !If [CreateAlarmFormatter, !Ref SNSAlertTopicArn, !Ref SharedAlarmFormatterTopicArn]
+      MetricName: Duration
+      Namespace: AWS/Lambda
+      Statistic: Maximum
+      Dimensions:
+        - Name: FunctionName
+          Value: !Sub '${Environment}_${EventsName}_transformation'
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 48000
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: OPCO
+          Value: !Ref OPCO
+        - Key: Severity
+          Value: High
+
+  # Data Freshness Monitoring Lambda IAM Role
+  DataFreshnessMonitorRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${Environment}_${OPCO}_customerend_data_freshness_monitor-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: AthenaAndCloudWatchAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - athena:StartQueryExecution
+                  - athena:GetQueryExecution
+                  - athena:GetQueryResults
+                Resource:
+                  - !Sub 'arn:aws:athena:${AWS::Region}:${AWS::AccountId}:workgroup/primary'
+              - Effect: Allow
+                Action:
+                  - glue:GetDatabase
+                  - glue:GetTable
+                  - glue:GetPartitions
+                Resource:
+                  - !Sub 'arn:aws:glue:${AWS::Region}:${AWS::AccountId}:catalog'
+                  - !Sub 'arn:aws:glue:${AWS::Region}:${AWS::AccountId}:database/${GlueDatabaseName}'
+                  - !Sub 'arn:aws:glue:${AWS::Region}:${AWS::AccountId}:table/${GlueDatabaseName}/${EventsName}'
+              - Effect: Allow
+                Action:
+                  - lakeformation:GetDataAccess
+                # lakeformation:GetDataAccess does not support resource-level permissions (IAM credential-vending
+                # action) -- access is actually controlled by the AWS::LakeFormation::Permissions grants elsewhere
+                # in this stack, not by this Resource clause.
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - s3:GetBucketLocation
+                  - s3:GetObject
+                  - s3:ListBucket
+                  - s3:PutObject
+                Resource:
+                  - !Sub 'arn:aws:s3:::aws-athena-query-results-${AWS::AccountId}-${AWS::Region}'
+                  - !Sub 'arn:aws:s3:::aws-athena-query-results-${AWS::AccountId}-${AWS::Region}/*'
+                  - !Sub 'arn:aws:s3:::${DataBucketName}'
+                  - !Sub 'arn:aws:s3:::${DataBucketName}/*'
+              - Effect: Allow
+                Action:
+                  - cloudwatch:PutMetricData
+                # cloudwatch:PutMetricData does not support resource-level permissions (AWS-wide limitation);
+                # narrowed as far as IAM allows via the cloudwatch:namespace condition below, matching the
+                # single namespace this function's Lambda code actually writes to.
+                Resource: '*'
+                Condition:
+                  StringEquals:
+                    cloudwatch:namespace: !Sub '${Environment}-${OPCO}_CustomerendPipeline'
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: OPCO
+          Value: !Ref OPCO
+
+  # Data Freshness Monitoring Lambda Function
+  DataFreshnessMonitorLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${Environment}_${OPCO}_customerend_data_freshness_monitor'
+      Runtime: python3.13
+      Handler: index.lambda_handler
+      Role: !GetAtt DataFreshnessMonitorRole.Arn
+      Timeout: 120
+      MemorySize: 256
+      Environment:
+        Variables:
+          GLUE_DATABASE: !Ref GlueDatabaseName
+          TABLE_NAME: !Sub '${EventsName}'
+          ATHENA_OUTPUT_LOCATION: !Sub 's3://aws-athena-query-results-${AWS::AccountId}-${AWS::Region}/data-freshness-checks/'
+          OPCO: !Ref OPCO
+          ENVIRONMENT: !Ref Environment
+      Code:
+        ZipFile: |
+          import boto3
+          import os
+          import time
+          from datetime import datetime, timezone
+
+          athena = boto3.client('athena')
+          cloudwatch = boto3.client('cloudwatch')
+
+          def lambda_handler(event, context):
+              database = os.environ['GLUE_DATABASE']
+              table = os.environ['TABLE_NAME']
+              output_location = os.environ['ATHENA_OUTPUT_LOCATION']
+              opco = os.environ['OPCO']
+              environment = os.environ['ENVIRONMENT']
+
+              namespace = f'{environment}-{opco}_CustomerendPipeline'
+
+              # Check table freshness
+              data_age = check_table_freshness(
+                  database, table, output_location, opco
+              )
+
+              # Post custom metric to CloudWatch
+              cloudwatch.put_metric_data(
+                  Namespace=namespace,
+                  MetricData=[
+                      {
+                          'MetricName': 'DataAgeMinutes',
+                          'Value': data_age,
+                          'Unit': 'None',
+                          'Timestamp': datetime.now(timezone.utc),
+                          'Dimensions': [
+                              {'Name': 'TableName', 'Value': 'customerend'},
+                              {'Name': 'OPCO', 'Value': opco}
+                          ]
+                      }
+                  ]
+              )
+
+              return {
+                  'statusCode': 200,
+                  'body': {'data_age_minutes': data_age}
+              }
+
+          def check_table_freshness(database, table, output_location, opco):
+              """Query Athena for max ingest_time and return age in minutes"""
+
+              query = f"""
+              SELECT
+                  to_iso8601(MAX(COALESCE(
+                      from_iso8601_timestamp(event_time),
+                      from_iso8601_timestamp(ingest_time)
+                  ))) AS max_timestamp
+              FROM "{database}"."{table}"
+              WHERE opco='{opco}'
+                AND dt=CAST(CURRENT_DATE AS VARCHAR)
+              """
+
+              # Start query execution
+              response = athena.start_query_execution(
+                  QueryString=query,
+                  QueryExecutionContext={'Database': database},
+                  ResultConfiguration={'OutputLocation': output_location}
+              )
+
+              query_execution_id = response['QueryExecutionId']
+
+              # Wait for query to complete
+              max_attempts = 30
+              attempt = 0
+              while attempt < max_attempts:
+                  result = athena.get_query_execution(QueryExecutionId=query_execution_id)
+                  state = result['QueryExecution']['Status']['State']
+
+                  if state == 'SUCCEEDED':
+                      break
+                  elif state in ['FAILED', 'CANCELLED']:
+                      print(f'Query {state}: {result["QueryExecution"]["Status"].get("StateChangeReason", "Unknown")}')
+                      return 9999  # Return very high age to trigger alarm
+
+                  time.sleep(2)
+                  attempt += 1
+
+              # Get query results
+              result = athena.get_query_results(QueryExecutionId=query_execution_id)
+
+              if len(result['ResultSet']['Rows']) < 2:
+                  return 9999  # No data found
+
+              max_timestamp_str = result['ResultSet']['Rows'][1]['Data'][0].get('VarCharValue')
+
+              if not max_timestamp_str:
+                  return 9999  # NULL timestamp
+
+              # Parse timestamp and calculate age in minutes
+              max_timestamp = datetime.fromisoformat(max_timestamp_str.replace('Z', '+00:00'))
+              now = datetime.now(timezone.utc)
+              age_minutes = (now - max_timestamp).total_seconds() / 60
+
+              return round(age_minutes, 2)
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: OPCO
+          Value: !Ref OPCO
+        - Key: Purpose
+          Value: Monitoring
+
+  # EventBridge Schedule to trigger freshness check every 5 minutes
+  DataFreshnessMonitorSchedule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub '${Environment}_${OPCO}_customerend_data_freshness_check'
+      Description: 'Check data freshness every 5 minutes'
+      ScheduleExpression: 'rate(5 minutes)'
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt DataFreshnessMonitorLambda.Arn
+          Id: DataFreshnessMonitorTarget
+
+  # Lambda Permission for EventBridge to invoke
+  DataFreshnessMonitorPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref DataFreshnessMonitorLambda
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt DataFreshnessMonitorSchedule.Arn
+
+  # Data Freshness Alarm (Custom Metric)
+  DataFreshnessAlarm:
+    Type: AWS::CloudWatch::Alarm
+    DependsOn: DataFreshnessMonitorLambda
+    Properties:
+      AlarmName: !Sub '${Environment}-${OPCO}_customerend_data_freshness'
+      AlarmDescription: !Sub 'Customerend data is older than ${DataFreshnessThresholdMinutes} minutes'
+      ActionsEnabled: true
+      AlarmActions:
+        - !If [CreateAlarmFormatter, !Ref SNSAlertTopicArn, !Ref SharedAlarmFormatterTopicArn]
+      OKActions:
+        - !If [CreateAlarmFormatter, !Ref SNSAlertTopicArn, !Ref SharedAlarmFormatterTopicArn]
+      MetricName: DataAgeMinutes
+      Namespace: !Sub '${Environment}-${OPCO}_CustomerendPipeline'
+      Statistic: Maximum
+      Dimensions:
+        - Name: TableName
+          Value: customerend
+        - Name: OPCO
+          Value: !Ref OPCO
+      Period: !Ref DataFreshnessAlarmPeriodSeconds
+      EvaluationPeriods: !Ref DataFreshnessAlarmEvaluationPeriods
+      Threshold: !Ref DataFreshnessThresholdMinutes
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: breaching
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: OPCO
+          Value: !Ref OPCO
+        - Key: Severity
+          Value: Critical
+
+  # ============================================================================
+  # Lake Formation Permissions for Data Freshness Monitor Lambda
+  # ============================================================================
+  LakeFormationPermsOnDBForMonitor:
+    Type: AWS::LakeFormation::Permissions
+    DependsOn:
+      - GlueTable
+      - DataFreshnessMonitorRole
+    Properties:
+      DataLakePrincipal:
+        DataLakePrincipalIdentifier: !GetAtt DataFreshnessMonitorRole.Arn
+      Permissions:
+        - DESCRIBE
+      Resource:
+        DatabaseResource:
+          CatalogId: !Ref AWS::AccountId
+          Name: !Ref GlueDatabaseName
+
+  LakeFormationPermsOnTableForMonitor:
+    Type: AWS::LakeFormation::Permissions
+    DependsOn: LakeFormationPermsOnDBForMonitor
+    Properties:
+      DataLakePrincipal:
+        DataLakePrincipalIdentifier: !GetAtt DataFreshnessMonitorRole.Arn
+      Permissions:
+        - DESCRIBE
+        - SELECT
+      Resource:
+       TableResource:
+          CatalogId: !Ref AWS::AccountId
+          DatabaseName: !Ref GlueDatabaseName
+          Name: !Ref GlueTable
+
+# ==========================================
+# Outputs
+# ==========================================
+Outputs:
+  LambdaFunctionArn:
+    Description: Lambda function ARN
+    Value: !GetAtt TransformationLambda.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-LambdaArn'
+
+  LambdaAliasArn:
+    Description: Lambda alias ARN (stable)
+    Value: !Ref LambdaAliasStable
+    Export:
+      Name: !Sub '${AWS::StackName}-LambdaAliasArn'
+
+  FirehoseDeliveryStreamArn:
+    Description: Firehose delivery stream ARN
+    Value: !GetAtt FirehoseDeliveryStream.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-FirehoseArn'
+
+  FirehoseDeliveryStreamName:
+    Description: Firehose delivery stream name
+    Value: !Ref FirehoseDeliveryStream
+    Export:
+      Name: !Sub '${AWS::StackName}-FirehoseName'
+
+  DLQArn:
+    Description: SQS DLQ ARN
+    Value: !GetAtt EventBridgeDLQ.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-DLQArn'
+
+  DLQUrl:
+    Description: SQS DLQ URL
+    Value: !Ref EventBridgeDLQ
+    Export:
+      Name: !Sub '${AWS::StackName}-DLQUrl'
+
+  GlueTableName:
+    Description: Glue table name
+    Value: !Ref GlueTable
+    Export:
+      Name: !Sub '${AWS::StackName}-GlueTable'
+
+  EventBridgeRuleArn:
+    Description: "ARN of the EventBridge rule"
+    Value: !GetAtt EventBridgeRule.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-EventBridgeRuleArn"
+
+  EventBridgeRuleName:
+    Description: "Name of the EventBridge rule"
+    Value: !Ref EventBridgeRule
+    Export:
+      Name: !Sub "${AWS::StackName}-EventBridgeRuleName"
+
+  EventBridgeFirehoseRoleArn:
+    Description: "ARN of the EventBridge to Firehose IAM role"
+    Value: !GetAtt EventBridgeFirehoseRole.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-EventBridgeFirehoseRoleArn"
+
+  DataFreshnessMonitorLambdaArn:
+    Description: ARN of the data freshness monitoring Lambda
+    Value: !GetAtt DataFreshnessMonitorLambda.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-FreshnessMonitor'

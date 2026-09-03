@@ -1,0 +1,34 @@
+{
+  "Rules": [
+    {
+      "ID": "GenesysVoiceDataLifecycle",
+      "Status": "Enabled",
+      "Filter": {
+        "Prefix": "genesys_voice_interactions/prod/"
+      },
+      "Transitions": [
+        {
+          "Days": 365,
+          "StorageClass": "STANDARD_IA"
+        },
+        {
+          "Days": 730,
+          "StorageClass": "GLACIER_IR"
+        },
+        {
+          "Days": 1825,
+          "StorageClass": "DEEP_ARCHIVE"
+        }
+      ],
+      "Expiration": {
+        "Days": 2555
+      },
+      "NoncurrentVersionExpiration": {
+        "NoncurrentDays": 90
+      },
+      "AbortIncompleteMultipartUpload": {
+        "DaysAfterInitiation": 7
+      }
+    }
+  ]
+}

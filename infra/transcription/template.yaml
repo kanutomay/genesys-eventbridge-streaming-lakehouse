@@ -1,0 +1,1734 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Genesys Voice TRANSCRIPTION Data Pipeline Infrastructure - DUAL OUTPUT (Sessions + Utterances) with CloudWatch Monitoring'
+
+# ==========================================
+# Parameters
+# ==========================================
+Parameters:
+  Environment:
+    Type: String
+    Default: prod
+    Description: Environment name
+    AllowedValues:
+      - dev
+      - staging
+      - prod
+
+  OPCO:
+    Type: String
+    Default: ACME
+    Description: Operating company code
+
+  OPCOLower:
+    Type: String
+    Default: acme
+    Description: Operating company code in lowercase
+
+  ProjectName:
+    Type: String
+    Default: genesys_reports
+    Description: Project name for resource naming
+
+  LambdaCodeS3Bucket:
+    Type: String
+    Description: >-
+      REQUIRED -- S3 bucket containing this pipeline's Lambda deployment package.
+      No default: this is an account-specific bucket you must create/own, not a shared or public one.
+    AllowedPattern: '.+'
+    ConstraintDescription: 'must be a non-empty S3 bucket name you control'
+
+  LambdaCodeS3Key:
+    Type: String
+    Default: genesys_voice_interactions/prod/transcription/voice_transcription_transformation_v1.0.1.zip
+    Description: S3 key for Lambda code zip file
+
+  S3BasePrefix:
+    Type: String
+    Default: genesys_voice_interactions
+    Description: Base S3 prefix for data storage
+
+  EventsName:
+    Type: String
+    Default: voice_transcription
+    Description: EventBridge rule name base
+
+  GenesysEventBusName:
+    Type: String
+    Default: aws.partner/genesys.com/cloud/00000000-0000-0000-0000-000000000000/genesys_acme
+    Description: Genesys partner event bus name
+
+  DataBucketName:
+    Type: String
+    Description: >-
+      REQUIRED -- S3 bucket for this pipeline's data storage (raw/transformed/error prefixes).
+      No default: this is an account-specific bucket you must create/own, not a shared or public one.
+    AllowedPattern: '.+'
+    ConstraintDescription: 'must be a non-empty S3 bucket name you control'
+
+  GlueDatabaseName:
+    Type: String
+    Default: genesys_streaming_lakehouse
+    Description: Glue database name (raw ingestion — the deduplicated curated view for this table lives in the separate genesys_streaming_lakehouse_curated database, see sql/views/)
+
+  CreateGlueDatabase:
+    Type: String
+    Default: 'false'
+    Description: Whether to create the Glue database (set to true if it doesn't exist)
+    AllowedValues:
+      - 'true'
+      - 'false'
+
+  DataFreshnessThresholdMinutes:
+    Type: Number
+    Description: Maximum age of data in minutes before alarming
+    Default: 30
+
+  DataFreshnessAlarmPeriodSeconds:
+    Type: Number
+    Description: Period in seconds for data freshness alarm evaluation
+    Default: 300
+
+  DataFreshnessAlarmEvaluationPeriods:
+    Type: Number
+    Description: Number of periods to evaluate before triggering data freshness alarm
+    Default: 4
+
+  LambdaErrorRateThreshold:
+    Type: Number
+    Description: Lambda error rate threshold percentage (0-100)
+    Default: 1
+    MinValue: 0
+    MaxValue: 100
+
+  SNSAlertTopicArn:
+    Type: String
+    Description: SNS Topic ARN for alert notifications
+    Default: arn:aws:sns:us-east-1:123456789012:genesys-pipeline-alerts
+
+  SharedAlarmFormatterTopicArn:
+    Type: String
+    Description: SNS Topic ARN of shared alarm formatter (leave empty to create new formatter)
+    Default: ''
+
+  DataLakeAdminRoleArn:
+    Type: String
+    Description: IAM role ARN granted DESCRIBE/SELECT on the staging table (e.g. a platform admin role)
+    Default: 'arn:aws:iam::123456789012:role/YOUR-LAKE-FORMATION-ADMIN-ROLE'
+
+  DataLakeWorkloadRoleArn:
+    Type: String
+    Description: IAM role ARN granted DESCRIBE/SELECT on the staging table (e.g. an analytics workload role)
+    Default: 'arn:aws:iam::123456789012:role/YOUR-LAKE-FORMATION-WORKLOAD-ROLE'
+
+  DLQKmsKeyArn:
+    Type: String
+    Description: >-
+      Optional customer-managed KMS key ARN for the dead-letter queue's server-side encryption.
+      Leave empty to use SQS-managed encryption (SSE-SQS, AWS-owned key) instead -- enabled by
+      default below.
+    Default: ''
+
+Conditions:
+  UseCustomerManagedKmsForDLQ: !Not [!Equals [!Ref DLQKmsKeyArn, '']]
+  ShouldCreateGlueDatabase: !Equals [!Ref CreateGlueDatabase, 'true']
+  CreateAlarmFormatter: !Equals [!Ref SharedAlarmFormatterTopicArn, '']
+
+# ==========================================
+# Resources
+# ==========================================
+Resources:
+  # ============================================================================
+  # SQS Dead-Letter Queue
+  # ============================================================================
+  EventBridgeDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub '${Environment}-${EventsName}-dlq'
+      MessageRetentionPeriod: 345600  # 4 days
+      VisibilityTimeout: 300  # 5 minutes
+      SqsManagedSseEnabled: !If [UseCustomerManagedKmsForDLQ, !Ref 'AWS::NoValue', true]
+      KmsMasterKeyId: !If [UseCustomerManagedKmsForDLQ, !Ref DLQKmsKeyArn, !Ref 'AWS::NoValue']
+      Tags:
+        - Key: env
+          Value: !Ref Environment
+        - Key: opco
+          Value: !Ref OPCO
+        - Key: project
+          Value: !Ref ProjectName
+
+  DLQPolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues:
+        - !Ref EventBridgeDLQ
+      PolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sqs:SendMessage
+            Resource: !GetAtt EventBridgeDLQ.Arn
+
+  # ============================================================================
+  # Lambda Execution Roles (Separate for Sessions and Utterances)
+  # ============================================================================
+  LambdaExecutionRoleSessions:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${Environment}_${EventsName}_transformation_sessions'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: CloudWatchLogsAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                  - logs:DescribeLogStreams
+                Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${Environment}_${EventsName}_transformation_sessions:*'
+      Tags:
+        - Key: env
+          Value: !Ref Environment
+        - Key: opco
+          Value: !Ref OPCO
+        - Key: project
+          Value: !Ref ProjectName
+
+  LambdaExecutionRoleUtterances:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${Environment}_${EventsName}_transformation_utterances'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: CloudWatchLogsAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                  - logs:DescribeLogStreams
+                Resource: !Sub 'arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${Environment}_${EventsName}_transformation_utterances:*'
+      Tags:
+        - Key: env
+          Value: !Ref Environment
+        - Key: opco
+          Value: !Ref OPCO
+        - Key: project
+          Value: !Ref ProjectName
+
+  # ============================================================================
+  # Lambda Functions (Separate for Sessions and Utterances streams)
+  # ============================================================================
+  TransformationLambdaSessions:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${Environment}_${EventsName}_transformation_sessions'
+      Description: Transform Genesys transcription events for Sessions table
+      Runtime: python3.13
+      Handler: lambda_function.lambda_handler
+      Role: !GetAtt LambdaExecutionRoleSessions.Arn
+      Code:
+        S3Bucket: !Ref LambdaCodeS3Bucket
+        S3Key: !Ref LambdaCodeS3Key
+      MemorySize: 512
+      Timeout: 60
+      ReservedConcurrentExecutions: 10
+      Environment:
+        Variables:
+          OPCO: !Ref OPCO
+          ENVIRONMENT: !Ref Environment
+          ENABLE_DEBUG: '0'
+          OUTPUT_TYPE: 'sessions'
+      TracingConfig:
+        Mode: Active
+      Tags:
+        - Key: env
+          Value: !Ref Environment
+        - Key: opco
+          Value: !Ref OPCO
+        - Key: project
+          Value: !Ref ProjectName
+        - Key: output_type
+          Value: sessions
+
+  TransformationLambdaUtterances:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${Environment}_${EventsName}_transformation_utterances'
+      Description: Transform Genesys transcription events for Utterances table
+      Runtime: python3.13
+      Handler: lambda_function.lambda_handler
+      Role: !GetAtt LambdaExecutionRoleUtterances.Arn
+      Code:
+        S3Bucket: !Ref LambdaCodeS3Bucket
+        S3Key: !Ref LambdaCodeS3Key
+      MemorySize: 512
+      Timeout: 60
+      ReservedConcurrentExecutions: 10
+      Environment:
+        Variables:
+          OPCO: !Ref OPCO
+          ENVIRONMENT: !Ref Environment
+          ENABLE_DEBUG: '0'
+          OUTPUT_TYPE: 'utterances'
+      TracingConfig:
+        Mode: Active
+      Tags:
+        - Key: env
+          Value: !Ref Environment
+        - Key: opco
+          Value: !Ref OPCO
+        - Key: project
+          Value: !Ref ProjectName
+        - Key: output_type
+          Value: utterances
+
+  # Lambda Aliases
+  LambdaAliasStableSessions:
+    Type: AWS::Lambda::Alias
+    Properties:
+      FunctionName: !Ref TransformationLambdaSessions
+      FunctionVersion: $LATEST
+      Name: stable
+      Description: Stable version for Sessions Firehose
+
+  LambdaAliasStableUtterances:
+    Type: AWS::Lambda::Alias
+    Properties:
+      FunctionName: !Ref TransformationLambdaUtterances
+      FunctionVersion: $LATEST
+      Name: stable
+      Description: Stable version for Utterances Firehose
+
+  # Lambda Log Groups (explicit creation for retention)
+  LambdaLogGroupSessions:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${Environment}_${EventsName}_transformation_sessions'
+      RetentionInDays: 30
+
+  LambdaLogGroupUtterances:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${Environment}_${EventsName}_transformation_utterances'
+      RetentionInDays: 30
+
+  # Lambda Invoke Permission for Sessions Firehose
+  LambdaInvokePermissionSessions:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref TransformationLambdaSessions
+      Action: lambda:InvokeFunction
+      Principal: firehose.amazonaws.com
+      SourceArn: !GetAtt FirehoseDeliveryStreamSessions.Arn
+
+  # Lambda Invoke Permission for Utterances Firehose
+  LambdaInvokePermissionUtterances:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref TransformationLambdaUtterances
+      Action: lambda:InvokeFunction
+      Principal: firehose.amazonaws.com
+      SourceArn: !GetAtt FirehoseDeliveryStreamUtterances.Arn
+
+  # ============================================================================
+  # Firehose Service Role (SHARED by both streams)
+  # ============================================================================
+  FirehoseRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub 'KinesisFirehoseServiceRole-${Environment}-${EventsName}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: firehose.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                sts:ExternalId: !Ref AWS::AccountId
+      Policies:
+        - PolicyName: S3Access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:AbortMultipartUpload
+                  - s3:GetBucketLocation
+                  - s3:GetObject
+                  - s3:ListBucket
+                  - s3:ListBucketMultipartUploads
+                  - s3:PutObject
+                Resource:
+                  - !Sub 'arn:aws:s3:::${DataBucketName}'
+                  - !Sub 'arn:aws:s3:::${DataBucketName}/*'
+        - PolicyName: LambdaInvoke
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - lambda:InvokeFunction
+                  - lambda:GetFunctionConfiguration
+                Resource:
+                  - !GetAtt TransformationLambdaSessions.Arn
+                  - !Sub '${TransformationLambdaSessions.Arn}:*'
+                  - !GetAtt TransformationLambdaUtterances.Arn
+                  - !Sub '${TransformationLambdaUtterances.Arn}:*'
+        - PolicyName: GlueAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - glue:GetTable
+                  - glue:GetTableVersion
+                  - glue:GetTableVersions
+                  - glue:GetDatabase
+                  - glue:GetPartition
+                  - glue:GetPartitions
+                  - glue:CreatePartition
+                  - glue:BatchCreatePartition
+                  - glue:UpdatePartition
+                  - glue:BatchUpdatePartition
+                  - glue:DeletePartition
+                  - glue:BatchDeletePartition
+                Resource:
+                  - !Sub 'arn:aws:glue:${AWS::Region}:${AWS::AccountId}:catalog'
+                  - !Sub 'arn:aws:glue:${AWS::Region}:${AWS::AccountId}:database/${GlueDatabaseName}'
+                  - !Sub 'arn:aws:glue:${AWS::Region}:${AWS::AccountId}:table/${GlueDatabaseName}/*'
+        - PolicyName: CloudWatchLogsAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource:
+                  - !GetAtt FirehoseLogGroupSessions.Arn
+                  - !GetAtt FirehoseLogGroupUtterances.Arn
+      Tags:
+        - Key: env
+          Value: !Ref Environment
+        - Key: opco
+          Value: !Ref OPCO
+        - Key: project
+          Value: !Ref ProjectName
+
+  # ============================================================================
+  # Glue Database (Conditional)
+  # ============================================================================
+  GlueDatabase:
+    Type: AWS::Glue::Database
+    Condition: ShouldCreateGlueDatabase
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseInput:
+        Name: !Ref GlueDatabaseName
+        Description: EventBridge staging database for Genesys events
+
+  # ============================================================================
+  # Glue Table - SESSIONS
+  # ============================================================================
+  GlueTableSessions:
+    Type: AWS::Glue::Table
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseName: !Ref GlueDatabaseName
+      TableInput:
+        Name: !Sub '${EventsName}_sessions'
+        Description: Genesys voice transcription session metadata
+        TableType: EXTERNAL_TABLE
+        Parameters:
+          classification: parquet
+          projection.enabled: 'true'
+          projection.opco.type: enum
+          projection.opco.values: !Ref OPCO
+          projection.dt.type: date
+          projection.dt.format: yyyy-MM-dd
+          projection.dt.range: 2024-01-01,NOW
+          storage.location.template: !Sub 's3://${DataBucketName}/${S3BasePrefix}/${Environment}/transcription/sessions/transformed/opco=${!opco}/dt=${!dt}/'
+        StorageDescriptor:
+          Columns:
+            # Metadata
+            - Name: event_id
+              Type: string
+              Comment: Unique event identifier from EventBridge
+            - Name: event_time
+              Type: string
+              Comment: Event occurrence time (ISO 8601)
+            - Name: ingest_time
+              Type: string
+              Comment: S3 write time from Firehose (ISO 8601)
+            - Name: conversation_id
+              Type: string
+              Comment: Conversation identifier (primary join key to other event tables)
+            - Name: interaction_id
+              Type: string
+              Comment: Interaction identifier (legacy)
+            - Name: communication_id
+              Type: string
+              Comment: Communication channel identifier within the conversation
+            # EventBridge envelope
+            - Name: eb_version
+              Type: string
+              Comment: EventBridge event version
+            - Name: eb_account
+              Type: string
+              Comment: AWS Account ID
+            - Name: eb_region
+              Type: string
+              Comment: AWS Region
+            - Name: eb_source
+              Type: string
+              Comment: Event source
+            - Name: eb_detail_type
+              Type: string
+              Comment: EventBridge detail type
+            - Name: eb_time
+              Type: string
+              Comment: EventBridge event time (ISO 8601)
+            - Name: topic_name
+              Type: string
+              Comment: Genesys topic name
+            - Name: topic_version
+              Type: string
+              Comment: Genesys topic version
+            - Name: correlation_id
+              Type: string
+              Comment: Genesys correlation identifier
+            - Name: genesys_timestamp
+              Type: string
+              Comment: Genesys event timestamp (ISO 8601)
+            - Name: genesys_event_time
+              Type: string
+              Comment: Genesys event timestamp (ISO 8601)
+            # Core Event Data
+            - Name: organization_id
+              Type: string
+              Comment: Genesys organization identifier
+            - Name: session_start_time_ms
+              Type: bigint
+              Comment: Session start epoch milliseconds
+            - Name: transcription_start_time_ms
+              Type: bigint
+              Comment: Transcription start epoch milliseconds
+            - Name: status
+              Type: string
+              Comment: SESSION_ONGOING or SESSION_ENDED
+            - Name: status_offset_ms
+              Type: bigint
+              Comment: Milliseconds from session start
+            - Name: is_session_ended
+              Type: boolean
+              Comment: True if status is SESSION_ENDED (optimized for queries)
+            - Name: is_session_ongoing
+              Type: boolean
+              Comment: True if status is SESSION_ONGOING (optimized for queries)
+            - Name: has_transcripts
+              Type: boolean
+              Comment: Whether this event contains transcripts
+            - Name: num_transcripts
+              Type: int
+              Comment: Number of utterances in this event
+            - Name: raw_event
+              Type: string
+              Comment: Full original EventBridge event as JSON
+          Location: !Sub 's3://${DataBucketName}/${S3BasePrefix}/${Environment}/transcription/sessions/transformed/'
+          InputFormat: org.apache.hadoop.hive.ql.io.parquet.MapredParquetInputFormat
+          OutputFormat: org.apache.hadoop.hive.ql.io.parquet.MapredParquetOutputFormat
+          SerdeInfo:
+            SerializationLibrary: org.apache.hadoop.hive.ql.io.parquet.serde.ParquetHiveSerDe
+          StoredAsSubDirectories: false
+        PartitionKeys:
+          - Name: opco
+            Type: string
+            Comment: Operating company code (PANAMA, TRI, FLOW, etc.)
+          - Name: dt
+            Type: string
+            Comment: Event date in UTC timezone (YYYY-MM-DD format)
+
+  # ============================================================================
+  # Glue Table - UTTERANCES
+  # ============================================================================
+  GlueTableUtterances:
+    Type: AWS::Glue::Table
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseName: !Ref GlueDatabaseName
+      TableInput:
+        Name: !Sub '${EventsName}_utterances'
+        Description: Genesys voice transcription utterances (transcripts stored as array)
+        TableType: EXTERNAL_TABLE
+        Parameters:
+          classification: parquet
+          projection.enabled: 'true'
+          projection.opco.type: enum
+          projection.opco.values: !Ref OPCO
+          projection.dt.type: date
+          projection.dt.format: yyyy-MM-dd
+          projection.dt.range: 2024-01-01,NOW
+          storage.location.template: !Sub 's3://${DataBucketName}/${S3BasePrefix}/${Environment}/transcription/utterances/transformed/opco=${!opco}/dt=${!dt}/'
+        StorageDescriptor:
+          Columns:
+            # Join Keys
+            - Name: conversation_id
+              Type: string
+              Comment: Conversation identifier (primary join key to other event tables)
+            - Name: interaction_id
+              Type: string
+              Comment: Interaction identifier (legacy)
+            - Name: communication_id
+              Type: string
+              Comment: Communication channel identifier within the conversation
+            # Metadata
+            - Name: event_id
+              Type: string
+              Comment: Unique event identifier from EventBridge
+            - Name: event_time
+              Type: string
+              Comment: Event occurrence time (ISO 8601)
+            - Name: ingest_time
+              Type: string
+              Comment: S3 write time from Firehose (ISO 8601)
+            - Name: num_transcripts
+              Type: int
+              Comment: Total number of utterances in this event
+            # Transcripts stored as JSON string (Firehose can't handle array<struct<>> properly)
+            - Name: transcripts
+              Type: string
+              Comment: JSON array of utterances (parse with json_extract/json_parse in views)
+          Location: !Sub 's3://${DataBucketName}/${S3BasePrefix}/${Environment}/transcription/utterances/transformed/'
+          InputFormat: org.apache.hadoop.hive.ql.io.parquet.MapredParquetInputFormat
+          OutputFormat: org.apache.hadoop.hive.ql.io.parquet.MapredParquetOutputFormat
+          SerdeInfo:
+            SerializationLibrary: org.apache.hadoop.hive.ql.io.parquet.serde.ParquetHiveSerDe
+          StoredAsSubDirectories: false
+        PartitionKeys:
+          - Name: opco
+            Type: string
+            Comment: Operating company code (PANAMA, TRI, FLOW, etc.)
+          - Name: dt
+            Type: string
+            Comment: Event date in UTC timezone (YYYY-MM-DD format)
+
+  # ============================================================================
+  # CloudWatch Log Groups for Firehose
+  # ============================================================================
+  FirehoseLogGroupSessions:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/kinesisfirehose/${Environment}-${EventsName}-sessions'
+      RetentionInDays: 30
+
+  FirehoseLogGroupUtterances:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/kinesisfirehose/${Environment}-${EventsName}-utterances'
+      RetentionInDays: 30
+
+  # ============================================================================
+  # Firehose Delivery Stream - SESSIONS
+  # ============================================================================
+  FirehoseDeliveryStreamSessions:
+    Type: AWS::KinesisFirehose::DeliveryStream
+    DependsOn:
+      - LambdaAliasStableSessions
+      - FirehoseRole
+      - FirehoseLogGroupSessions
+      - GlueTableSessions
+      - LakeFormationPermsOnSessionsTable
+    Properties:
+      DeliveryStreamName: !Sub '${Environment}-${EventsName}-sessions'
+      DeliveryStreamType: DirectPut
+      ExtendedS3DestinationConfiguration:
+        BucketARN: !Sub 'arn:aws:s3:::${DataBucketName}'
+        RoleARN: !GetAtt FirehoseRole.Arn
+        Prefix: !Sub "${S3BasePrefix}/${Environment}/transcription/sessions/transformed/opco=!{partitionKeyFromQuery:opco}/dt=!{partitionKeyFromQuery:dt}/"
+        ErrorOutputPrefix: !Sub "${S3BasePrefix}/${Environment}/transcription/sessions/errors/!{firehose:error-output-type}/opco=${OPCO}/dt=!{timestamp:yyyy-MM-dd}/"
+        BufferingHints:
+          SizeInMBs: 64
+          IntervalInSeconds: 60
+        CompressionFormat: UNCOMPRESSED
+        DynamicPartitioningConfiguration:
+          Enabled: true
+          RetryOptions:
+            DurationInSeconds: 300
+        ProcessingConfiguration:
+          Enabled: true
+          Processors:
+            - Type: Lambda
+              Parameters:
+                - ParameterName: LambdaArn
+                  ParameterValue: !Ref LambdaAliasStableSessions
+                - ParameterName: BufferSizeInMBs
+                  ParameterValue: '1'
+                - ParameterName: BufferIntervalInSeconds
+                  ParameterValue: '60'
+            - Type: MetadataExtraction
+              Parameters:
+                - ParameterName: MetadataExtractionQuery
+                  ParameterValue: '{opco:.opco,dt:.dt}'
+                - ParameterName: JsonParsingEngine
+                  ParameterValue: JQ-1.6
+        DataFormatConversionConfiguration:
+          SchemaConfiguration:
+            DatabaseName: !Ref GlueDatabaseName
+            TableName: !Ref GlueTableSessions
+            Region: !Ref AWS::Region
+            RoleARN: !GetAtt FirehoseRole.Arn
+          InputFormatConfiguration:
+            Deserializer:
+              OpenXJsonSerDe: {}
+          OutputFormatConfiguration:
+            Serializer:
+              ParquetSerDe:
+                Compression: SNAPPY
+          Enabled: true
+        S3BackupMode: Enabled
+        S3BackupConfiguration:
+          BucketARN: !Sub 'arn:aws:s3:::${DataBucketName}'
+          RoleARN: !GetAtt FirehoseRole.Arn
+          Prefix: !Sub "${S3BasePrefix}/${Environment}/transcription/sessions/raw/opco=${OPCO}/dt=!{timestamp:yyyy-MM-dd}/"
+          ErrorOutputPrefix: !Sub "${S3BasePrefix}/${Environment}/transcription/sessions/errors/!{firehose:error-output-type}/opco=${OPCO}/dt=!{timestamp:yyyy-MM-dd}/"
+          BufferingHints:
+            SizeInMBs: 5
+            IntervalInSeconds: 300
+          CompressionFormat: GZIP
+        CloudWatchLoggingOptions:
+          Enabled: true
+          LogGroupName: !Ref FirehoseLogGroupSessions
+          LogStreamName: S3Delivery
+      Tags:
+        - Key: env
+          Value: !Ref Environment
+        - Key: opco
+          Value: !Ref OPCO
+        - Key: project
+          Value: !Ref ProjectName
+        - Key: stream_type
+          Value: sessions
+
+  # ============================================================================
+  # Firehose Delivery Stream - UTTERANCES
+  # ============================================================================
+  FirehoseDeliveryStreamUtterances:
+    Type: AWS::KinesisFirehose::DeliveryStream
+    DependsOn:
+      - LambdaAliasStableUtterances
+      - FirehoseRole
+      - FirehoseLogGroupUtterances
+      - GlueTableUtterances
+      - LakeFormationPermsOnUtterancesTable
+    Properties:
+      DeliveryStreamName: !Sub '${Environment}-${EventsName}-utterances'
+      DeliveryStreamType: DirectPut
+      ExtendedS3DestinationConfiguration:
+        BucketARN: !Sub 'arn:aws:s3:::${DataBucketName}'
+        RoleARN: !GetAtt FirehoseRole.Arn
+        Prefix: !Sub "${S3BasePrefix}/${Environment}/transcription/utterances/transformed/opco=!{partitionKeyFromQuery:opco}/dt=!{partitionKeyFromQuery:dt}/"
+        ErrorOutputPrefix: !Sub "${S3BasePrefix}/${Environment}/transcription/utterances/errors/!{firehose:error-output-type}/opco=${OPCO}/dt=!{timestamp:yyyy-MM-dd}/"
+        BufferingHints:
+          SizeInMBs: 64
+          IntervalInSeconds: 60
+        CompressionFormat: UNCOMPRESSED
+        DynamicPartitioningConfiguration:
+          Enabled: true
+          RetryOptions:
+            DurationInSeconds: 300
+        ProcessingConfiguration:
+          Enabled: true
+          Processors:
+            - Type: Lambda
+              Parameters:
+                - ParameterName: LambdaArn
+                  ParameterValue: !Ref LambdaAliasStableUtterances
+                - ParameterName: BufferSizeInMBs
+                  ParameterValue: '1'
+                - ParameterName: BufferIntervalInSeconds
+                  ParameterValue: '60'
+            - Type: MetadataExtraction
+              Parameters:
+                - ParameterName: MetadataExtractionQuery
+                  ParameterValue: '{opco:.opco,dt:.dt}'
+                - ParameterName: JsonParsingEngine
+                  ParameterValue: JQ-1.6
+        DataFormatConversionConfiguration:
+          SchemaConfiguration:
+            DatabaseName: !Ref GlueDatabaseName
+            TableName: !Ref GlueTableUtterances
+            Region: !Ref AWS::Region
+            RoleARN: !GetAtt FirehoseRole.Arn
+          InputFormatConfiguration:
+            Deserializer:
+              OpenXJsonSerDe: {}
+          OutputFormatConfiguration:
+            Serializer:
+              ParquetSerDe:
+                Compression: SNAPPY
+          Enabled: true
+        S3BackupMode: Enabled
+        S3BackupConfiguration:
+          BucketARN: !Sub 'arn:aws:s3:::${DataBucketName}'
+          RoleARN: !GetAtt FirehoseRole.Arn
+          Prefix: !Sub "${S3BasePrefix}/${Environment}/transcription/utterances/raw/opco=${OPCO}/dt=!{timestamp:yyyy-MM-dd}/"
+          ErrorOutputPrefix: !Sub "${S3BasePrefix}/${Environment}/transcription/utterances/errors/!{firehose:error-output-type}/opco=${OPCO}/dt=!{timestamp:yyyy-MM-dd}/"
+          BufferingHints:
+            SizeInMBs: 5
+            IntervalInSeconds: 300
+          CompressionFormat: GZIP
+        CloudWatchLoggingOptions:
+          Enabled: true
+          LogGroupName: !Ref FirehoseLogGroupUtterances
+          LogStreamName: S3Delivery
+      Tags:
+        - Key: env
+          Value: !Ref Environment
+        - Key: opco
+          Value: !Ref OPCO
+        - Key: project
+          Value: !Ref ProjectName
+        - Key: stream_type
+          Value: utterances
+
+  # ============================================================================
+  # IAM Role for EventBridge to invoke BOTH Firehose Streams
+  # ============================================================================
+  EventBridgeFirehoseRole:
+    Type: AWS::IAM::Role
+    DependsOn:
+      - FirehoseDeliveryStreamSessions
+      - FirehoseDeliveryStreamUtterances
+    Properties:
+      RoleName: !Sub "EventBridge_Invoke_Firehose_${Environment}-${EventsName}"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: EventBridgeFirehosePolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: ActionsForBothFirehoseStreams
+                Effect: Allow
+                Action:
+                  - firehose:PutRecord
+                  - firehose:PutRecordBatch
+                Resource:
+                  - !GetAtt FirehoseDeliveryStreamSessions.Arn
+                  - !GetAtt FirehoseDeliveryStreamUtterances.Arn
+      Tags:
+        - Key: env
+          Value: !Ref Environment
+        - Key: opco
+          Value: !Ref OPCO
+        - Key: project
+          Value: !Ref ProjectName
+
+  # ============================================================================
+  # EventBridge Rule (Targets BOTH Firehose Streams)
+  # ============================================================================
+  EventBridgeRule:
+    Type: AWS::Events::Rule
+    DependsOn:
+      - EventBridgeFirehoseRole
+      - EventBridgeDLQ
+    Properties:
+      Name: !Sub "${Environment}-${EventsName}"
+      Description: "Genesys voice transcription events to dual Firehose (sessions + utterances)"
+      EventBusName: !Ref GenesysEventBusName
+      EventPattern:
+        source:
+          - prefix: "aws.partner/genesys.com"
+        detail-type:
+          - "v2.conversations.{id}.transcription"
+      State: ENABLED
+      Targets:
+        # Target 1: Sessions Firehose
+        - Id: !Sub "${Environment}-${EventsName}-sessions-target"
+          Arn: !GetAtt FirehoseDeliveryStreamSessions.Arn
+          RoleArn: !GetAtt EventBridgeFirehoseRole.Arn
+          DeadLetterConfig:
+            Arn: !GetAtt EventBridgeDLQ.Arn
+        # Target 2: Utterances Firehose
+        - Id: !Sub "${Environment}-${EventsName}-utterances-target"
+          Arn: !GetAtt FirehoseDeliveryStreamUtterances.Arn
+          RoleArn: !GetAtt EventBridgeFirehoseRole.Arn
+          DeadLetterConfig:
+            Arn: !GetAtt EventBridgeDLQ.Arn
+      Tags:
+        - Key: env
+          Value: !Ref Environment
+        - Key: opco
+          Value: !Ref OPCO
+        - Key: project
+          Value: !Ref ProjectName
+
+  # EventBridge Archive for replay capability
+  EventBridgeArchive:
+    Type: AWS::Events::Archive
+    Properties:
+      ArchiveName: !Sub ${Environment}-${EventsName}-archive
+      Description: !Sub Genesys voice transcription events archive for ${Environment}
+        - enables transformation replays
+      SourceArn: !Sub arn:aws:events:${AWS::Region}:${AWS::AccountId}:event-bus/${GenesysEventBusName}
+      EventPattern:
+        source:
+          - prefix: aws.partner/genesys.com
+        detail-type:
+          - "v2.conversations.{id}.transcription"
+      RetentionDays: 90
+
+  # ============================================================================
+  # Lake Formation Permissions for Kinesis Firehose Role
+  # ============================================================================
+  LakeFormationPermsOnStagingDB:
+    Type: AWS::LakeFormation::Permissions
+    DependsOn:
+      - GlueTableSessions
+      - GlueTableUtterances
+      - FirehoseRole
+    Properties:
+      DataLakePrincipal:
+        DataLakePrincipalIdentifier: !GetAtt FirehoseRole.Arn
+      Permissions:
+        - DESCRIBE
+      Resource:
+        DatabaseResource:
+          CatalogId: !Ref AWS::AccountId
+          Name: !Ref GlueDatabaseName
+
+  LakeFormationPermsOnSessionsTable:
+    Type: AWS::LakeFormation::Permissions
+    DependsOn: LakeFormationPermsOnStagingDB
+    Properties:
+      DataLakePrincipal:
+        DataLakePrincipalIdentifier: !GetAtt FirehoseRole.Arn
+      Permissions:
+        - DESCRIBE
+        - SELECT
+      Resource:
+       TableResource:
+          CatalogId: !Ref AWS::AccountId
+          DatabaseName: !Ref GlueDatabaseName
+          Name: !Ref GlueTableSessions
+
+  LakeFormationPermsOnUtterancesTable:
+    Type: AWS::LakeFormation::Permissions
+    DependsOn: LakeFormationPermsOnStagingDB
+    Properties:
+      DataLakePrincipal:
+        DataLakePrincipalIdentifier: !GetAtt FirehoseRole.Arn
+      Permissions:
+        - DESCRIBE
+        - SELECT
+      Resource:
+       TableResource:
+          CatalogId: !Ref AWS::AccountId
+          DatabaseName: !Ref GlueDatabaseName
+          Name: !Ref GlueTableUtterances
+
+  # ============================================================================
+  # Lake Formation Permissions for Data Freshness Monitor Lambda
+  # ============================================================================
+  LakeFormationPermsOnDBForMonitor:
+    Type: AWS::LakeFormation::Permissions
+    DependsOn:
+      - GlueTableSessions
+      - GlueTableUtterances
+      - DataFreshnessMonitorRole
+    Properties:
+      DataLakePrincipal:
+        DataLakePrincipalIdentifier: !GetAtt DataFreshnessMonitorRole.Arn
+      Permissions:
+        - DESCRIBE
+      Resource:
+        DatabaseResource:
+          CatalogId: !Ref AWS::AccountId
+          Name: !Ref GlueDatabaseName
+
+  LakeFormationPermsOnSessionsTableForMonitor:
+    Type: AWS::LakeFormation::Permissions
+    DependsOn: LakeFormationPermsOnDBForMonitor
+    Properties:
+      DataLakePrincipal:
+        DataLakePrincipalIdentifier: !GetAtt DataFreshnessMonitorRole.Arn
+      Permissions:
+        - DESCRIBE
+        - SELECT
+      Resource:
+       TableResource:
+          CatalogId: !Ref AWS::AccountId
+          DatabaseName: !Ref GlueDatabaseName
+          Name: !Ref GlueTableSessions
+
+  LakeFormationPermsOnUtterancesTableForMonitor:
+    Type: AWS::LakeFormation::Permissions
+    DependsOn: LakeFormationPermsOnDBForMonitor
+    Properties:
+      DataLakePrincipal:
+        DataLakePrincipalIdentifier: !GetAtt DataFreshnessMonitorRole.Arn
+      Permissions:
+        - DESCRIBE
+        - SELECT
+      Resource:
+       TableResource:
+          CatalogId: !Ref AWS::AccountId
+          DatabaseName: !Ref GlueDatabaseName
+          Name: !Ref GlueTableUtterances
+
+  # ============================================================================
+  # Lake Formation Permissions for additional roles/users - SESSIONS TABLE
+  # ============================================================================
+  LakeFormationAdditionalAdminAccessSessions:
+    Type: AWS::LakeFormation::Permissions
+    DependsOn:
+      - GlueTableSessions
+      - LakeFormationPermsOnStagingDB
+    Properties:
+      DataLakePrincipal:
+        DataLakePrincipalIdentifier: !Ref DataLakeAdminRoleArn
+      Permissions:
+        - DESCRIBE
+        - SELECT
+      Resource:
+       TableResource:
+          CatalogId: !Ref AWS::AccountId
+          DatabaseName: !Ref GlueDatabaseName
+          Name: !Ref GlueTableSessions
+
+  LakeFormationAdditionalWorkloadAccessSessions:
+    Type: AWS::LakeFormation::Permissions
+    DependsOn:
+      - GlueTableSessions
+      - LakeFormationPermsOnStagingDB
+    Properties:
+      DataLakePrincipal:
+        DataLakePrincipalIdentifier: !Ref DataLakeWorkloadRoleArn
+      Permissions:
+        - DESCRIBE
+        - SELECT
+      Resource:
+       TableResource:
+          CatalogId: !Ref AWS::AccountId
+          DatabaseName: !Ref GlueDatabaseName
+          Name: !Ref GlueTableSessions
+
+  # ============================================================================
+  # Lake Formation Permissions for additional roles/users - UTTERANCES TABLE
+  # ============================================================================
+  LakeFormationAdditionalAdminAccessUtterances:
+    Type: AWS::LakeFormation::Permissions
+    DependsOn:
+      - GlueTableUtterances
+      - LakeFormationPermsOnStagingDB
+    Properties:
+      DataLakePrincipal:
+        DataLakePrincipalIdentifier: !Ref DataLakeAdminRoleArn
+      Permissions:
+        - DESCRIBE
+        - SELECT
+      Resource:
+       TableResource:
+          CatalogId: !Ref AWS::AccountId
+          DatabaseName: !Ref GlueDatabaseName
+          Name: !Ref GlueTableUtterances
+
+  LakeFormationAdditionalWorkloadAccessUtterances:
+    Type: AWS::LakeFormation::Permissions
+    DependsOn:
+      - GlueTableUtterances
+      - LakeFormationPermsOnStagingDB
+    Properties:
+      DataLakePrincipal:
+        DataLakePrincipalIdentifier: !Ref DataLakeWorkloadRoleArn
+      Permissions:
+        - DESCRIBE
+        - SELECT
+      Resource:
+       TableResource:
+          CatalogId: !Ref AWS::AccountId
+          DatabaseName: !Ref GlueDatabaseName
+          Name: !Ref GlueTableUtterances
+
+  # ============================================================================
+  # CloudWatch Alarms for Monitoring
+  # ============================================================================
+
+  # DLQ Depth Alarm
+  DLQDepthAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${Environment}-${OPCO}_transcription_dlq_depth'
+      AlarmDescription: 'Dead Letter Queue has unprocessed failed events'
+      ActionsEnabled: true
+      AlarmActions:
+        - !If [CreateAlarmFormatter, !Ref SNSAlertTopicArn, !Ref SharedAlarmFormatterTopicArn]
+      OKActions:
+        - !If [CreateAlarmFormatter, !Ref SNSAlertTopicArn, !Ref SharedAlarmFormatterTopicArn]
+      MetricName: ApproximateNumberOfMessagesVisible
+      Namespace: AWS/SQS
+      Statistic: Maximum
+      Dimensions:
+        - Name: QueueName
+          Value: !Sub '${Environment}-${OPCO}_genesys_voice_transcription-dlq'
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 10
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: OPCO
+          Value: !Ref OPCO
+        - Key: Severity
+          Value: High
+
+  # Lambda Error Rate Alarms
+  SessionsLambdaErrorRateAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${Environment}-${OPCO}_transcription_sessions_lambda_error_rate'
+      AlarmDescription: 'Sessions Lambda error rate exceeds threshold'
+      ActionsEnabled: true
+      AlarmActions:
+        - !If [CreateAlarmFormatter, !Ref SNSAlertTopicArn, !Ref SharedAlarmFormatterTopicArn]
+      OKActions:
+        - !If [CreateAlarmFormatter, !Ref SNSAlertTopicArn, !Ref SharedAlarmFormatterTopicArn]
+      MetricName: Errors
+      Namespace: AWS/Lambda
+      Statistic: Sum
+      Dimensions:
+        - Name: FunctionName
+          Value: !Sub '${Environment}_${OPCO}_genesys_voice_transcription_transformation_sessions'
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 5
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: OPCO
+          Value: !Ref OPCO
+        - Key: Severity
+          Value: High
+
+  UtterancesLambdaErrorRateAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${Environment}-${OPCO}_transcription_utterances_lambda_error_rate'
+      AlarmDescription: 'Utterances Lambda error rate exceeds threshold'
+      ActionsEnabled: true
+      AlarmActions:
+        - !If [CreateAlarmFormatter, !Ref SNSAlertTopicArn, !Ref SharedAlarmFormatterTopicArn]
+      OKActions:
+        - !If [CreateAlarmFormatter, !Ref SNSAlertTopicArn, !Ref SharedAlarmFormatterTopicArn]
+      MetricName: Errors
+      Namespace: AWS/Lambda
+      Statistic: Sum
+      Dimensions:
+        - Name: FunctionName
+          Value: !Sub '${Environment}_${OPCO}_genesys_voice_transcription_transformation_utterances'
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 5
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: OPCO
+          Value: !Ref OPCO
+        - Key: Severity
+          Value: High
+
+  # Lambda Error Percentage Alarm
+  SessionsLambdaErrorPercentageAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${Environment}-${OPCO}_transcription_sessions_lambda_error_percentage'
+      AlarmDescription: !Sub 'Sessions Lambda error rate exceeds ${LambdaErrorRateThreshold}%'
+      ActionsEnabled: true
+      AlarmActions:
+        - !If [CreateAlarmFormatter, !Ref SNSAlertTopicArn, !Ref SharedAlarmFormatterTopicArn]
+      OKActions:
+        - !If [CreateAlarmFormatter, !Ref SNSAlertTopicArn, !Ref SharedAlarmFormatterTopicArn]
+      Metrics:
+        - Id: error_rate
+          Expression: (errors / invocations) * 100
+          Label: Error Rate Percentage
+        - Id: errors
+          MetricStat:
+            Metric:
+              Namespace: AWS/Lambda
+              MetricName: Errors
+              Dimensions:
+                - Name: FunctionName
+                  Value: !Sub '${Environment}_${OPCO}_genesys_voice_transcription_transformation_sessions'
+            Period: 300
+            Stat: Sum
+          ReturnData: false
+        - Id: invocations
+          MetricStat:
+            Metric:
+              Namespace: AWS/Lambda
+              MetricName: Invocations
+              Dimensions:
+                - Name: FunctionName
+                  Value: !Sub '${Environment}_${OPCO}_genesys_voice_transcription_transformation_sessions'
+            Period: 300
+            Stat: Sum
+          ReturnData: false
+      EvaluationPeriods: 2
+      Threshold: !Ref LambdaErrorRateThreshold
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: OPCO
+          Value: !Ref OPCO
+        - Key: Severity
+          Value: Critical
+
+  # Lambda Error Percentage Alarm - Utterances
+  UtterancesLambdaErrorPercentageAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${Environment}-${OPCO}_transcription_utterances_lambda_error_percentage'
+      AlarmDescription: !Sub 'Utterances Lambda error rate exceeds ${LambdaErrorRateThreshold}%'
+      ActionsEnabled: true
+      AlarmActions:
+        - !If [CreateAlarmFormatter, !Ref SNSAlertTopicArn, !Ref SharedAlarmFormatterTopicArn]
+      OKActions:
+        - !If [CreateAlarmFormatter, !Ref SNSAlertTopicArn, !Ref SharedAlarmFormatterTopicArn]
+      Metrics:
+        - Id: error_rate
+          Expression: (errors / invocations) * 100
+          Label: Error Rate Percentage
+        - Id: errors
+          MetricStat:
+            Metric:
+              Namespace: AWS/Lambda
+              MetricName: Errors
+              Dimensions:
+                - Name: FunctionName
+                  Value: !Sub '${Environment}_${OPCO}_genesys_voice_transcription_transformation_utterances'
+            Period: 300
+            Stat: Sum
+          ReturnData: false
+        - Id: invocations
+          MetricStat:
+            Metric:
+              Namespace: AWS/Lambda
+              MetricName: Invocations
+              Dimensions:
+                - Name: FunctionName
+                  Value: !Sub '${Environment}_${OPCO}_genesys_voice_transcription_transformation_utterances'
+            Period: 300
+            Stat: Sum
+          ReturnData: false
+      EvaluationPeriods: 2
+      Threshold: !Ref LambdaErrorRateThreshold
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: OPCO
+          Value: !Ref OPCO
+        - Key: Severity
+          Value: Critical
+
+  # Lambda Duration Alarms
+  SessionsLambdaDurationAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${Environment}-${OPCO}_transcription_sessions_lambda_duration'
+      AlarmDescription: 'Sessions Lambda approaching timeout'
+      ActionsEnabled: true
+      AlarmActions:
+        - !If [CreateAlarmFormatter, !Ref SNSAlertTopicArn, !Ref SharedAlarmFormatterTopicArn]
+      OKActions:
+        - !If [CreateAlarmFormatter, !Ref SNSAlertTopicArn, !Ref SharedAlarmFormatterTopicArn]
+      MetricName: Duration
+      Namespace: AWS/Lambda
+      Statistic: Maximum
+      Dimensions:
+        - Name: FunctionName
+          Value: !Sub '${Environment}_${OPCO}_genesys_voice_transcription_transformation_sessions'
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 48000
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: OPCO
+          Value: !Ref OPCO
+        - Key: Severity
+          Value: High
+
+  UtterancesLambdaDurationAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub '${Environment}-${OPCO}_transcription_utterances_lambda_duration'
+      AlarmDescription: 'Utterances Lambda approaching timeout'
+      ActionsEnabled: true
+      AlarmActions:
+        - !If [CreateAlarmFormatter, !Ref SNSAlertTopicArn, !Ref SharedAlarmFormatterTopicArn]
+      OKActions:
+        - !If [CreateAlarmFormatter, !Ref SNSAlertTopicArn, !Ref SharedAlarmFormatterTopicArn]
+      MetricName: Duration
+      Namespace: AWS/Lambda
+      Statistic: Maximum
+      Dimensions:
+        - Name: FunctionName
+          Value: !Sub '${Environment}_${OPCO}_genesys_voice_transcription_transformation_utterances'
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 48000
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: OPCO
+          Value: !Ref OPCO
+        - Key: Severity
+          Value: High
+
+  # Data Freshness Monitoring Lambda IAM Role
+  DataFreshnessMonitorRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${Environment}_${OPCO}_transcription_data_freshness_monitor-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: AthenaAndCloudWatchAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - athena:StartQueryExecution
+                  - athena:GetQueryExecution
+                  - athena:GetQueryResults
+                Resource:
+                  - !Sub 'arn:aws:athena:${AWS::Region}:${AWS::AccountId}:workgroup/primary'
+              - Effect: Allow
+                Action:
+                  - glue:GetDatabase
+                  - glue:GetTable
+                  - glue:GetPartitions
+                Resource:
+                  - !Sub 'arn:aws:glue:${AWS::Region}:${AWS::AccountId}:catalog'
+                  - !Sub 'arn:aws:glue:${AWS::Region}:${AWS::AccountId}:database/${GlueDatabaseName}'
+                  - !Sub 'arn:aws:glue:${AWS::Region}:${AWS::AccountId}:table/${GlueDatabaseName}/${EventsName}'
+              - Effect: Allow
+                Action:
+                  - lakeformation:GetDataAccess
+                # lakeformation:GetDataAccess does not support resource-level permissions (IAM credential-vending
+                # action) -- access is actually controlled by the AWS::LakeFormation::Permissions grants elsewhere
+                # in this stack, not by this Resource clause.
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - s3:GetBucketLocation
+                  - s3:GetObject
+                  - s3:ListBucket
+                  - s3:PutObject
+                Resource:
+                  - !Sub 'arn:aws:s3:::aws-athena-query-results-${AWS::AccountId}-${AWS::Region}'
+                  - !Sub 'arn:aws:s3:::aws-athena-query-results-${AWS::AccountId}-${AWS::Region}/*'
+                  - !Sub 'arn:aws:s3:::${DataBucketName}'
+                  - !Sub 'arn:aws:s3:::${DataBucketName}/*'
+              - Effect: Allow
+                Action:
+                  - cloudwatch:PutMetricData
+                # cloudwatch:PutMetricData does not support resource-level permissions (AWS-wide limitation);
+                # narrowed as far as IAM allows via the cloudwatch:namespace condition below, matching the
+                # single namespace this function's Lambda code actually writes to.
+                Resource: '*'
+                Condition:
+                  StringEquals:
+                    cloudwatch:namespace: !Sub '${Environment}-${OPCO}_TranscriptionPipeline'
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: OPCO
+          Value: !Ref OPCO
+
+  # Data Freshness Monitoring Lambda Function
+  DataFreshnessMonitorLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${Environment}_${OPCO}_transcription_data_freshness_monitor'
+      Runtime: python3.13
+      Handler: index.lambda_handler
+      Role: !GetAtt DataFreshnessMonitorRole.Arn
+      Timeout: 120
+      MemorySize: 256
+      Environment:
+        Variables:
+          GLUE_DATABASE: !Ref GlueDatabaseName
+          SESSIONS_TABLE: !Sub '${OPCO}_genesys_voice_transcription_sessions'
+          UTTERANCES_TABLE: !Sub '${OPCO}_genesys_voice_transcription_utterances'
+          ATHENA_OUTPUT_LOCATION: !Sub 's3://aws-athena-query-results-${AWS::AccountId}-${AWS::Region}/data-freshness-checks/'
+          OPCO: !Ref OPCO
+          ENVIRONMENT: !Ref Environment
+      Code:
+        ZipFile: |
+          import boto3
+          import os
+          import time
+          from datetime import datetime, timezone
+
+          athena = boto3.client('athena')
+          cloudwatch = boto3.client('cloudwatch')
+
+          def lambda_handler(event, context):
+              database = os.environ['GLUE_DATABASE']
+              sessions_table = os.environ['SESSIONS_TABLE']
+              utterances_table = os.environ['UTTERANCES_TABLE']
+              output_location = os.environ['ATHENA_OUTPUT_LOCATION']
+              opco = os.environ['OPCO']
+              environment = os.environ['ENVIRONMENT']
+
+              namespace = f'{environment}-{opco}_TranscriptionPipeline'
+
+              # Check sessions table freshness
+              sessions_age = check_table_freshness(
+                  database, sessions_table, output_location, opco
+              )
+
+              # Check utterances table freshness
+              utterances_age = check_table_freshness(
+                  database, utterances_table, output_location, opco
+              )
+
+              # Post custom metrics to CloudWatch
+              cloudwatch.put_metric_data(
+                  Namespace=namespace,
+                  MetricData=[
+                      {
+                          'MetricName': 'SessionsDataAgeMinutes',
+                          'Value': sessions_age,
+                          'Unit': 'None',
+                          'Timestamp': datetime.now(timezone.utc),
+                          'Dimensions': [
+                              {'Name': 'TableName', 'Value': 'sessions'},
+                              {'Name': 'OPCO', 'Value': opco}
+                          ]
+                      },
+                      {
+                          'MetricName': 'UtterancesDataAgeMinutes',
+                          'Value': utterances_age,
+                          'Unit': 'None',
+                          'Timestamp': datetime.now(timezone.utc),
+                          'Dimensions': [
+                              {'Name': 'TableName', 'Value': 'utterances'},
+                              {'Name': 'OPCO', 'Value': opco}
+                          ]
+                      }
+                  ]
+              )
+
+              return {
+                  'statusCode': 200,
+                  'body': {
+                      'sessions_age_minutes': sessions_age,
+                      'utterances_age_minutes': utterances_age
+                  }
+              }
+
+          def check_table_freshness(database, table, output_location, opco):
+              """Query Athena for max ingest_time and return age in minutes"""
+
+              query = f"""
+              SELECT
+                  to_iso8601(MAX(COALESCE(
+                      from_iso8601_timestamp(event_time),
+                      from_iso8601_timestamp(ingest_time)
+                  ))) AS max_timestamp
+              FROM "{database}"."{table}"
+              WHERE opco='{opco}'
+                AND dt=CAST(CURRENT_DATE AS VARCHAR)
+              """
+
+              # Start query execution
+              response = athena.start_query_execution(
+                  QueryString=query,
+                  QueryExecutionContext={'Database': database},
+                  ResultConfiguration={'OutputLocation': output_location}
+              )
+
+              query_execution_id = response['QueryExecutionId']
+
+              # Wait for query to complete
+              max_attempts = 30
+              attempt = 0
+              while attempt < max_attempts:
+                  result = athena.get_query_execution(QueryExecutionId=query_execution_id)
+                  state = result['QueryExecution']['Status']['State']
+
+                  if state == 'SUCCEEDED':
+                      break
+                  elif state in ['FAILED', 'CANCELLED']:
+                      print(f'Query {state}: {result["QueryExecution"]["Status"].get("StateChangeReason", "Unknown")}')
+                      return 9999  # Return very high age to trigger alarm
+
+                  time.sleep(2)
+                  attempt += 1
+
+              # Get query results
+              result = athena.get_query_results(QueryExecutionId=query_execution_id)
+
+              if len(result['ResultSet']['Rows']) < 2:
+                  return 9999  # No data found
+
+              max_timestamp_str = result['ResultSet']['Rows'][1]['Data'][0].get('VarCharValue')
+
+              if not max_timestamp_str:
+                  return 9999  # NULL timestamp
+
+              # Parse timestamp and calculate age in minutes
+              max_timestamp = datetime.fromisoformat(max_timestamp_str.replace('Z', '+00:00'))
+              now = datetime.now(timezone.utc)
+              age_minutes = (now - max_timestamp).total_seconds() / 60
+
+              return round(age_minutes, 2)
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: OPCO
+          Value: !Ref OPCO
+        - Key: Purpose
+          Value: Monitoring
+
+  # EventBridge Schedule to trigger freshness check every 5 minutes
+  DataFreshnessMonitorSchedule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub '${Environment}_${OPCO}_transcription_data_freshness_check'
+      Description: 'Check data freshness every 5 minutes'
+      ScheduleExpression: 'rate(5 minutes)'
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt DataFreshnessMonitorLambda.Arn
+          Id: DataFreshnessMonitorTarget
+
+  # Lambda Permission for EventBridge to invoke
+  DataFreshnessMonitorPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref DataFreshnessMonitorLambda
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt DataFreshnessMonitorSchedule.Arn
+
+  # Data Freshness Alarms (Custom Metrics)
+  SessionsDataFreshnessAlarm:
+    Type: AWS::CloudWatch::Alarm
+    DependsOn: DataFreshnessMonitorLambda
+    Properties:
+      AlarmName: !Sub '${Environment}-${OPCO}_transcription_sessions_data_freshness'
+      AlarmDescription: !Sub 'Sessions data is older than ${DataFreshnessThresholdMinutes} minutes'
+      ActionsEnabled: true
+      AlarmActions:
+        - !If [CreateAlarmFormatter, !Ref SNSAlertTopicArn, !Ref SharedAlarmFormatterTopicArn]
+      OKActions:
+        - !If [CreateAlarmFormatter, !Ref SNSAlertTopicArn, !Ref SharedAlarmFormatterTopicArn]
+      MetricName: SessionsDataAgeMinutes
+      Namespace: !Sub '${Environment}-${OPCO}_TranscriptionPipeline'
+      Statistic: Maximum
+      Dimensions:
+        - Name: TableName
+          Value: sessions
+        - Name: OPCO
+          Value: !Ref OPCO
+      Period: !Ref DataFreshnessAlarmPeriodSeconds
+      EvaluationPeriods: !Ref DataFreshnessAlarmEvaluationPeriods
+      Threshold: !Ref DataFreshnessThresholdMinutes
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: breaching
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: OPCO
+          Value: !Ref OPCO
+        - Key: Severity
+          Value: Critical
+
+  UtterancesDataFreshnessAlarm:
+    Type: AWS::CloudWatch::Alarm
+    DependsOn: DataFreshnessMonitorLambda
+    Properties:
+      AlarmName: !Sub '${Environment}-${OPCO}_transcription_utterances_data_freshness'
+      AlarmDescription: !Sub 'Utterances data is older than ${DataFreshnessThresholdMinutes} minutes'
+      ActionsEnabled: true
+      AlarmActions:
+        - !If [CreateAlarmFormatter, !Ref SNSAlertTopicArn, !Ref SharedAlarmFormatterTopicArn]
+      OKActions:
+        - !If [CreateAlarmFormatter, !Ref SNSAlertTopicArn, !Ref SharedAlarmFormatterTopicArn]
+      MetricName: UtterancesDataAgeMinutes
+      Namespace: !Sub '${Environment}-${OPCO}_TranscriptionPipeline'
+      Statistic: Maximum
+      Dimensions:
+        - Name: TableName
+          Value: utterances
+        - Name: OPCO
+          Value: !Ref OPCO
+      Period: !Ref DataFreshnessAlarmPeriodSeconds
+      EvaluationPeriods: !Ref DataFreshnessAlarmEvaluationPeriods
+      Threshold: !Ref DataFreshnessThresholdMinutes
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: breaching
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: OPCO
+          Value: !Ref OPCO
+        - Key: Severity
+          Value: Critical
+
+# ==========================================
+# Outputs
+# ==========================================
+Outputs:
+  LambdaFunctionSessionsArn:
+    Description: Lambda function ARN for Sessions stream
+    Value: !GetAtt TransformationLambdaSessions.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-LambdaSessionsArn'
+
+  LambdaFunctionUtterancesArn:
+    Description: Lambda function ARN for Utterances stream
+    Value: !GetAtt TransformationLambdaUtterances.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-LambdaUtterancesArn'
+
+  LambdaAliasSessionsArn:
+    Description: Lambda alias ARN for Sessions (stable)
+    Value: !Ref LambdaAliasStableSessions
+    Export:
+      Name: !Sub '${AWS::StackName}-LambdaAliasSessionsArn'
+
+  LambdaAliasUtterancesArn:
+    Description: Lambda alias ARN for Utterances (stable)
+    Value: !Ref LambdaAliasStableUtterances
+    Export:
+      Name: !Sub '${AWS::StackName}-LambdaAliasUtterancesArn'
+
+  FirehoseDeliveryStreamSessionsArn:
+    Description: Firehose delivery stream ARN (sessions)
+    Value: !GetAtt FirehoseDeliveryStreamSessions.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-FirehoseSessionsArn'
+
+  FirehoseDeliveryStreamSessionsName:
+    Description: Firehose delivery stream name (sessions)
+    Value: !Ref FirehoseDeliveryStreamSessions
+    Export:
+      Name: !Sub '${AWS::StackName}-FirehoseSessionsName'
+
+  FirehoseDeliveryStreamUtterancesArn:
+    Description: Firehose delivery stream ARN (utterances)
+    Value: !GetAtt FirehoseDeliveryStreamUtterances.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-FirehoseUtterancesArn'
+
+  FirehoseDeliveryStreamUtterancesName:
+    Description: Firehose delivery stream name (utterances)
+    Value: !Ref FirehoseDeliveryStreamUtterances
+    Export:
+      Name: !Sub '${AWS::StackName}-FirehoseUtterancesName'
+
+  DLQArn:
+    Description: SQS DLQ ARN (shared by both targets)
+    Value: !GetAtt EventBridgeDLQ.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-DLQArn'
+
+  DLQUrl:
+    Description: SQS DLQ URL
+    Value: !Ref EventBridgeDLQ
+    Export:
+      Name: !Sub '${AWS::StackName}-DLQUrl'
+
+  GlueTableSessionsName:
+    Description: Glue table name (sessions)
+    Value: !Ref GlueTableSessions
+    Export:
+      Name: !Sub '${AWS::StackName}-GlueTableSessions'
+
+  GlueTableUtterancesName:
+    Description: Glue table name (utterances)
+    Value: !Ref GlueTableUtterances
+    Export:
+      Name: !Sub '${AWS::StackName}-GlueTableUtterances'
+
+  EventBridgeRuleArn:
+    Description: "ARN of the EventBridge rule"
+    Value: !GetAtt EventBridgeRule.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-EventBridgeRuleArn"
+
+  EventBridgeRuleName:
+    Description: "Name of the EventBridge rule"
+    Value: !Ref EventBridgeRule
+    Export:
+      Name: !Sub "${AWS::StackName}-EventBridgeRuleName"
+
+  EventBridgeFirehoseRoleArn:
+    Description: "ARN of the EventBridge to Firehose IAM role"
+    Value: !GetAtt EventBridgeFirehoseRole.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-EventBridgeFirehoseRoleArn"
+
+  DataFreshnessMonitorLambdaArn:
+    Description: ARN of the data freshness monitoring Lambda
+    Value: !GetAtt DataFreshnessMonitorLambda.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-FreshnessMonitor'

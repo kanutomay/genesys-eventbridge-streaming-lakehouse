@@ -1,0 +1,828 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Genesys Voice Mappers - AWS Glue Python Shell Job Infrastructure - v1.0.0
+
+Parameters:
+  Environment:
+    Type: String
+    Default: prod
+    Description: Environment name (prod, dev, test)
+
+  OPCO:
+    Type: String
+    Default: ACME
+    Description: Operating Company code
+
+  OPCOLower:
+    Type: String
+    Default: acme
+    Description: Operating Company code in lowercase
+
+  ProjectName:
+    Type: String
+    Default: genesys_reports
+    Description: Project name for resource naming
+
+  # Glue job code location
+  GlueCodeS3Bucket:
+    Type: String
+    Description: >-
+      REQUIRED -- S3 bucket containing the Mappers Glue job's Python script.
+      No default: this is an account-specific bucket you must create/own, not a shared or public one.
+    AllowedPattern: '.+'
+    ConstraintDescription: 'must be a non-empty S3 bucket name you control'
+
+  GlueCodeS3Key:
+    Type: String
+    Default: genesys_voice_interactions/prod/mappers/genesys_mappers_glue_job_v1.0.0.py
+    Description: S3 key for Glue job Python script
+
+  # Secrets Manager ARN
+  SecretArn:
+    Type: String
+    Default: arn:aws:secretsmanager:us-east-1:123456789012:secret:genesys-mappers/PureCloudPlatformClientV2-XXXXXX
+    Description: ARN of Secrets Manager secret containing Genesys API credentials
+
+  # SNS Topic ARN
+  SNSTopicArn:
+    Type: String
+    Default: arn:aws:sns:us-east-1:123456789012:genesys-pipeline-alerts
+    Description: ARN of SNS topic for error notifications
+
+  # Target S3 bucket for Parquet files
+  TargetS3Bucket:
+    Type: String
+    Description: >-
+      REQUIRED -- S3 bucket where the Mappers Glue job writes Parquet output.
+      No default: this is an account-specific bucket you must create/own, not a shared or public one.
+    AllowedPattern: '.+'
+    ConstraintDescription: 'must be a non-empty S3 bucket name you control'
+
+  UsersS3Prefix:
+    Type: String
+    Default: genesys_voice_interactions/prod/mappers/users
+    Description: S3 prefix for users mapper Parquet files
+
+  QueuesS3Prefix:
+    Type: String
+    Default: genesys_voice_interactions/prod/mappers/queues
+    Description: S3 prefix for queues mapper Parquet files
+
+  # Glue Database
+  GlueDatabase:
+    Type: String
+    Default: genesys_streaming_lakehouse_curated
+    Description: Glue Data Catalog database name (the curated/consumer-facing database — see sql/views/ for the "_current" views built on top of the base tables here)
+
+  #Glue Tables:
+  UsersGlueTable:
+    Type: String
+    Default: voice_mapper_users
+    Description: Glue table name for users mapper (base, dt-partitioned — see sql/views/voice_mapper_users_current.sql for the latest-snapshot view)
+
+  QueuesGlueTable:
+    Type: String
+    Default: voice_mapper_queues
+    Description: Glue table name for queues mapper (base, dt-partitioned — see sql/views/voice_mapper_queues_current.sql for the latest-snapshot view)
+
+  # Job execution settings
+  MaxRetries:
+    Type: Number
+    Default: 1
+    Description: Maximum number of retries for failed Glue job runs
+
+  TimeoutMinutes:
+    Type: Number
+    Default: 30
+    Description: Glue job timeout in minutes
+
+  MaxCapacity:
+    Type: Number
+    Default: 0.0625
+    Description: DPU capacity for Python Shell job (0.0625 or 1.0)
+
+  # Monitoring parameters
+  DataFreshnessThresholdHours:
+    Type: Number
+    Description: Maximum age of mapper data in hours before alarming
+    Default: 36
+
+  DataFreshnessAlarmPeriodSeconds:
+    Type: Number
+    Description: Period in seconds for data freshness metric
+    Default: 3600
+
+  DataFreshnessAlarmEvaluationPeriods:
+    Type: Number
+    Description: Number of evaluation periods for data freshness alarm
+    Default: 2
+
+  GlueJobDurationThresholdMinutes:
+    Type: Number
+    Description: Glue job duration threshold in minutes (warn before timeout)
+    Default: 20
+
+  SharedAlarmFormatterTopicArn:
+    Type: String
+    Description: SNS Topic ARN of shared alarm formatter (leave empty to create new formatter)
+    Default: ''
+
+  DataLakeAdminRoleArn:
+    Type: String
+    Description: IAM role ARN granted DESCRIBE/SELECT on the staging table (e.g. a platform admin role)
+    Default: 'arn:aws:iam::123456789012:role/YOUR-LAKE-FORMATION-ADMIN-ROLE'
+
+  DataLakeWorkloadRoleArn:
+    Type: String
+    Description: IAM role ARN granted DESCRIBE/SELECT on the staging table (e.g. an analytics workload role)
+    Default: 'arn:aws:iam::123456789012:role/YOUR-LAKE-FORMATION-WORKLOAD-ROLE'
+
+Conditions:
+  CreateAlarmFormatter: !Equals [!Ref SharedAlarmFormatterTopicArn, '']
+
+Resources:
+  # ============================================
+  # IAM Role for Glue Job
+  # ============================================
+  GlueJobRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${Environment}_${OPCOLower}_genesys_mappers_glue_role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: glue.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSGlueServiceRole
+      Policies:
+        - PolicyName: GlueJobExecutionPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # S3 permissions for reading/writing Parquet files
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:DeleteObject
+                Resource:
+                  - !Sub arn:aws:s3:::${TargetS3Bucket}/${UsersS3Prefix}/*
+                  - !Sub arn:aws:s3:::${TargetS3Bucket}/${QueuesS3Prefix}/*
+
+              - Effect: Allow
+                Action:
+                  - s3:ListBucket
+                Resource:
+                  - !Sub arn:aws:s3:::${TargetS3Bucket}
+
+              # S3 permissions for reading Glue job script
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                Resource:
+                  - !Sub arn:aws:s3:::${GlueCodeS3Bucket}/${GlueCodeS3Key}
+
+              # Glue Data Catalog permissions
+              - Effect: Allow
+                Action:
+                  - glue:GetDatabase
+                  - glue:GetTable
+                  - glue:GetPartitions
+                  - glue:CreateTable
+                  - glue:UpdateTable
+                  - glue:CreatePartition
+                  - glue:BatchCreatePartition
+                  - glue:UpdatePartition
+                Resource:
+                  - !Sub arn:aws:glue:${AWS::Region}:${AWS::AccountId}:catalog
+                  - !Sub arn:aws:glue:${AWS::Region}:${AWS::AccountId}:database/${GlueDatabase}
+                  - !Sub arn:aws:glue:${AWS::Region}:${AWS::AccountId}:table/${GlueDatabase}/*
+
+              # Secrets Manager permissions
+              - Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                Resource:
+                  - !Ref SecretArn
+
+              # SNS permissions
+              - Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource:
+                  - !Ref SNSTopicArn
+
+              # CloudWatch Logs permissions
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource:
+                  - !Sub arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws-glue/python-jobs/*
+
+  # ============================================
+  # Glue Python Shell Job
+  # ============================================
+  GenesysMappersGlueJob:
+    Type: AWS::Glue::Job
+    Properties:
+      Name: !Sub ${Environment}_${OPCOLower}_genesys_mappers_job
+      Description: Fetches users and queues from Genesys Cloud API and writes to S3 as
+        Parquet
+      Role: !GetAtt GlueJobRole.Arn
+      Command:
+        Name: pythonshell
+        ScriptLocation: !Sub s3://${GlueCodeS3Bucket}/${GlueCodeS3Key}
+        PythonVersion: '3.9'
+      DefaultArguments:
+        '--SECRET_ARN': !Ref SecretArn
+        '--S3_BUCKET': !Ref TargetS3Bucket
+        '--USERS_S3_PREFIX': !Ref UsersS3Prefix
+        '--QUEUES_S3_PREFIX': !Ref QueuesS3Prefix
+        '--SNS_ARN': !Ref SNSTopicArn
+        '--GLUE_DATABASE': !Ref GlueDatabase
+        '--LOG_LEVEL': INFO
+        '--additional-python-modules': PureCloudPlatformClientV2,urllib3==1.26.7
+        '--enable-metrics': 'true'
+        '--enable-continuous-cloudwatch-log': 'true'
+        '--enable-continuous-log-filter': 'true'
+      MaxRetries: !Ref MaxRetries
+      Timeout: !Ref TimeoutMinutes
+      MaxCapacity: !Ref MaxCapacity
+      GlueVersion: '3.0'
+      Tags:
+        Environment: !Ref Environment
+        OPCO: !Ref OPCO
+        Project: !Ref ProjectName
+        ManagedBy: CloudFormation
+
+  # ============================================
+  # Glue Trigger for Daily Execution (Native Scheduler)
+  # ============================================
+  DailyGlueJobTrigger:
+    Type: AWS::Glue::Trigger
+    Properties:
+      Name: !Sub ${Environment}-${OPCOLower}-genesys-mappers-trigger
+      Description: Triggers Genesys mappers Glue job daily at 6 AM UTC
+      Type: SCHEDULED
+      Schedule: cron(0 6 * * ? *)
+      StartOnCreation: true
+      Actions:
+        - JobName: !Ref GenesysMappersGlueJob
+      Tags:
+        Environment: !Ref Environment
+        OPCO: !Ref OPCO
+        Project: !Ref ProjectName
+
+  # ============================================================================
+  # Lake Formation Permissions for Glue Job Role
+  # ============================================================================
+  LakeFormationPermsOnDatabase:
+    Type: AWS::LakeFormation::Permissions
+    DependsOn: GlueJobRole
+    Properties:
+      DataLakePrincipal:
+        DataLakePrincipalIdentifier: !GetAtt GlueJobRole.Arn
+      Permissions:
+        - DESCRIBE
+        - CREATE_TABLE
+      Resource:
+        DatabaseResource:
+          CatalogId: !Ref AWS::AccountId
+          Name: !Ref GlueDatabase
+
+  LakeFormationPermsOnTables:
+    Type: AWS::LakeFormation::Permissions
+    DependsOn: LakeFormationPermsOnDatabase
+    Properties:
+      DataLakePrincipal:
+        DataLakePrincipalIdentifier: !GetAtt GlueJobRole.Arn
+      Permissions:
+        - DESCRIBE
+        - SELECT
+        - INSERT
+        - DELETE
+        - ALTER
+      PermissionsWithGrantOption:
+        - DESCRIBE
+        - SELECT
+        - INSERT
+        - DELETE
+        - ALTER
+      Resource:
+        TableResource:
+          CatalogId: !Ref AWS::AccountId
+          DatabaseName: !Ref GlueDatabase
+          TableWildcard: {}
+
+  # ============================================================================
+  # Lake Formation Permissions for additional roles/users
+  # ============================================================================
+  LakeFormationAdditionalAdminAccessUsersTable:
+    Type: AWS::LakeFormation::Permissions
+    DependsOn: LakeFormationPermsOnTables
+    Properties:
+      DataLakePrincipal:
+        DataLakePrincipalIdentifier: !Ref DataLakeAdminRoleArn
+      Permissions:
+        - DESCRIBE
+        - SELECT
+      Resource:
+        TableResource:
+          CatalogId: !Ref AWS::AccountId
+          DatabaseName: !Ref GlueDatabase
+          Name: !Ref UsersGlueTable
+
+  LakeFormationAdditionalAdminAccessQueuesTable:
+    Type: AWS::LakeFormation::Permissions
+    DependsOn: LakeFormationPermsOnTables
+    Properties:
+      DataLakePrincipal:
+        DataLakePrincipalIdentifier: !Ref DataLakeAdminRoleArn
+      Permissions:
+        - DESCRIBE
+        - SELECT
+      Resource:
+        TableResource:
+          CatalogId: !Ref AWS::AccountId
+          DatabaseName: !Ref GlueDatabase
+          Name: !Ref QueuesGlueTable
+
+  LakeFormationAdditionalWorkloadAccessUsersTable:
+    Type: AWS::LakeFormation::Permissions
+    DependsOn: LakeFormationPermsOnTables
+    Properties:
+      DataLakePrincipal:
+        DataLakePrincipalIdentifier: !Ref DataLakeWorkloadRoleArn
+      Permissions:
+        - DESCRIBE
+        - SELECT
+      Resource:
+        TableResource:
+          CatalogId: !Ref AWS::AccountId
+          DatabaseName: !Ref GlueDatabase
+          Name: !Ref UsersGlueTable
+
+  LakeFormationAdditionalWorkloadAccessQueuesTable:
+    Type: AWS::LakeFormation::Permissions
+    DependsOn: LakeFormationPermsOnTables
+    Properties:
+      DataLakePrincipal:
+        DataLakePrincipalIdentifier: !Ref DataLakeWorkloadRoleArn
+      Permissions:
+        - DESCRIBE
+        - SELECT
+      Resource:
+        TableResource:
+          CatalogId: !Ref AWS::AccountId
+          DatabaseName: !Ref GlueDatabase
+          Name: !Ref QueuesGlueTable
+
+  # ============================================================================
+  # CloudWatch Alarms for Glue Job Monitoring
+  # ============================================================================
+
+  # EventBridge Rule for Glue Job Failures
+  GlueJobFailureRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub '${Environment}-${OPCOLower}-mappers-job-failure-alarm'
+      Description: 'Detects Glue mappers job failures and publishes to SNS'
+      EventPattern:
+        source:
+          - aws.glue
+        detail-type:
+          - Glue Job State Change
+        detail:
+          jobName:
+            - !Ref GenesysMappersGlueJob
+          state:
+            - FAILED
+            - TIMEOUT
+            - STOPPED
+      State: ENABLED
+      Targets:
+        - Arn: !If [CreateAlarmFormatter, !Ref SNSTopicArn, !Ref SharedAlarmFormatterTopicArn]
+          Id: SNSTarget
+          InputTransformer:
+            InputPathsMap:
+              jobName: $.detail.jobName
+              state: $.detail.state
+              message: $.detail.message
+            InputTemplate: |
+              {
+                "AlarmName": "<jobName>-failure",
+                "AlarmDescription": "Glue job <jobName> entered <state> state",
+                "NewStateValue": "ALARM",
+                "NewStateReason": "Job failure: <message>",
+                "StateChangeTime": "$.time",
+                "Region": "us-east-1",
+                "AlarmArn": "arn:aws:cloudwatch:us-east-1:123456789012:alarm:<jobName>-failure"
+              }
+
+  # SNS Topic Policy to allow EventBridge to publish
+  GlueJobFailureRuleSNSPermission:
+    Type: AWS::SNS::TopicPolicy
+    Properties:
+      Topics:
+        - !If [CreateAlarmFormatter, !Ref SNSTopicArn, !Ref SharedAlarmFormatterTopicArn]
+      PolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sns:Publish
+            Resource: !If [CreateAlarmFormatter, !Ref SNSTopicArn, !Ref SharedAlarmFormatterTopicArn]
+            Condition:
+              ArnEquals:
+                aws:SourceArn: !GetAtt GlueJobFailureRule.Arn
+
+  # Data Freshness Monitoring Lambda IAM Role
+  DataFreshnessMonitorRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${Environment}_${OPCOLower}_mappers_data_freshness_monitor-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: AthenaAndCloudWatchAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - athena:StartQueryExecution
+                  - athena:GetQueryExecution
+                  - athena:GetQueryResults
+                Resource:
+                  - !Sub 'arn:aws:athena:${AWS::Region}:${AWS::AccountId}:workgroup/primary'
+              - Effect: Allow
+                Action:
+                  - glue:GetDatabase
+                  - glue:GetTable
+                  - glue:GetPartitions
+                Resource:
+                  - !Sub 'arn:aws:glue:${AWS::Region}:${AWS::AccountId}:catalog'
+                  - !Sub 'arn:aws:glue:${AWS::Region}:${AWS::AccountId}:database/${GlueDatabase}'
+                  - !Sub 'arn:aws:glue:${AWS::Region}:${AWS::AccountId}:table/${GlueDatabase}/${UsersGlueTable}'
+                  - !Sub 'arn:aws:glue:${AWS::Region}:${AWS::AccountId}:table/${GlueDatabase}/${QueuesGlueTable}'
+              - Effect: Allow
+                Action:
+                  - lakeformation:GetDataAccess
+                # lakeformation:GetDataAccess does not support resource-level permissions (IAM credential-vending
+                # action) -- access is actually controlled by the AWS::LakeFormation::Permissions grants elsewhere
+                # in this stack, not by this Resource clause.
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - s3:GetBucketLocation
+                  - s3:GetObject
+                  - s3:ListBucket
+                  - s3:PutObject
+                Resource:
+                  - !Sub 'arn:aws:s3:::aws-athena-query-results-${AWS::AccountId}-${AWS::Region}'
+                  - !Sub 'arn:aws:s3:::aws-athena-query-results-${AWS::AccountId}-${AWS::Region}/*'
+                  - !Sub 'arn:aws:s3:::${TargetS3Bucket}'
+                  - !Sub 'arn:aws:s3:::${TargetS3Bucket}/*'
+              - Effect: Allow
+                Action:
+                  - cloudwatch:PutMetricData
+                # cloudwatch:PutMetricData does not support resource-level permissions (AWS-wide limitation);
+                # narrowed as far as IAM allows via the cloudwatch:namespace condition below, matching the
+                # single namespace this function's Lambda code actually writes to.
+                Resource: '*'
+                Condition:
+                  StringEquals:
+                    cloudwatch:namespace: !Sub '${Environment}-${OPCO}_MappersPipeline'
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: OPCO
+          Value: !Ref OPCO
+
+  # Data Freshness Monitoring Lambda Function
+  DataFreshnessMonitorLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${Environment}_${OPCOLower}_mappers_data_freshness_monitor'
+      Runtime: python3.13
+      Handler: index.lambda_handler
+      Role: !GetAtt DataFreshnessMonitorRole.Arn
+      Timeout: 120
+      MemorySize: 256
+      Environment:
+        Variables:
+          GLUE_DATABASE: !Ref GlueDatabase
+          USERS_TABLE: !Ref UsersGlueTable
+          QUEUES_TABLE: !Ref QueuesGlueTable
+          ATHENA_OUTPUT_LOCATION: !Sub 's3://aws-athena-query-results-${AWS::AccountId}-${AWS::Region}/mappers-freshness-checks/'
+          OPCO: !Ref OPCO
+          ENVIRONMENT: !Ref Environment
+      Code:
+        ZipFile: |
+          import boto3
+          import os
+          import time
+          from datetime import datetime, timezone
+
+          athena = boto3.client('athena')
+          cloudwatch = boto3.client('cloudwatch')
+
+          def lambda_handler(event, context):
+              database = os.environ['GLUE_DATABASE']
+              users_table = os.environ['USERS_TABLE']
+              queues_table = os.environ['QUEUES_TABLE']
+              output_location = os.environ['ATHENA_OUTPUT_LOCATION']
+              opco = os.environ['OPCO']
+              environment = os.environ['ENVIRONMENT']
+
+              namespace = f'{environment}-{opco}_MappersPipeline'
+
+              # Check users table freshness
+              users_age_hours = check_table_freshness(
+                  database, users_table, output_location
+              )
+
+              # Check queues table freshness
+              queues_age_hours = check_table_freshness(
+                  database, queues_table, output_location
+              )
+
+              # Post custom metrics to CloudWatch
+              cloudwatch.put_metric_data(
+                  Namespace=namespace,
+                  MetricData=[
+                      {
+                          'MetricName': 'UsersDataAgeHours',
+                          'Value': users_age_hours,
+                          'Unit': 'None',
+                          'Timestamp': datetime.now(timezone.utc),
+                          'Dimensions': [
+                              {'Name': 'TableName', 'Value': 'users'},
+                              {'Name': 'OPCO', 'Value': opco}
+                          ]
+                      },
+                      {
+                          'MetricName': 'QueuesDataAgeHours',
+                          'Value': queues_age_hours,
+                          'Unit': 'None',
+                          'Timestamp': datetime.now(timezone.utc),
+                          'Dimensions': [
+                              {'Name': 'TableName', 'Value': 'queues'},
+                              {'Name': 'OPCO', 'Value': opco}
+                          ]
+                      }
+                  ]
+              )
+
+              return {
+                  'statusCode': 200,
+                  'body': {
+                      'users_age_hours': users_age_hours,
+                      'queues_age_hours': queues_age_hours
+                  }
+              }
+
+          def check_table_freshness(database, table, output_location):
+              """Query Athena for max dt partition and return age in hours"""
+
+              query = f"""
+              SELECT MAX(dt) as max_date
+              FROM \"{database}\".\"{table}\"
+              """
+
+              response = athena.start_query_execution(
+                  QueryString=query,
+                  QueryExecutionContext={'Database': database},
+                  ResultConfiguration={'OutputLocation': output_location}
+              )
+
+              query_execution_id = response['QueryExecutionId']
+
+              # Wait for query to complete
+              while True:
+                  query_status = athena.get_query_execution(
+                      QueryExecutionId=query_execution_id
+                  )
+                  status = query_status['QueryExecution']['Status']['State']
+
+                  if status in ['SUCCEEDED', 'FAILED', 'CANCELLED']:
+                      break
+
+                  time.sleep(1)
+
+              if status != 'SUCCEEDED':
+                  print(f"Query failed for {table}: {status}")
+                  return 999.0  # Return high value to trigger alarm
+
+              # Get results
+              results = athena.get_query_results(
+                  QueryExecutionId=query_execution_id
+              )
+
+              if len(results['ResultSet']['Rows']) < 2:
+                  print(f"No data found in {table}")
+                  return 999.0
+
+              max_date_str = results['ResultSet']['Rows'][1]['Data'][0].get('VarCharValue')
+
+              if not max_date_str:
+                  print(f"No max date found in {table}")
+                  return 999.0
+
+              # Parse date and calculate age
+              max_date = datetime.strptime(max_date_str, '%Y-%m-%d')
+              max_date = max_date.replace(tzinfo=timezone.utc)
+              now = datetime.now(timezone.utc)
+              age_hours = (now - max_date).total_seconds() / 3600
+
+              print(f"{table}: max_date={max_date_str}, age={age_hours:.2f} hours")
+              return round(age_hours, 2)
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: OPCO
+          Value: !Ref OPCO
+        - Key: Purpose
+          Value: Monitoring
+
+  # EventBridge Schedule to trigger freshness check every hour
+  DataFreshnessMonitorSchedule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub '${Environment}_${OPCOLower}_mappers_data_freshness_check'
+      Description: 'Check mappers data freshness every hour'
+      ScheduleExpression: 'rate(1 hour)'
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt DataFreshnessMonitorLambda.Arn
+          Id: DataFreshnessMonitorTarget
+
+  # Lambda Permission for EventBridge to invoke
+  DataFreshnessMonitorPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref DataFreshnessMonitorLambda
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt DataFreshnessMonitorSchedule.Arn
+
+  # Lake Formation Permissions for Data Freshness Monitor Lambda
+  LakeFormationPermsOnDBForMonitor:
+    Type: AWS::LakeFormation::Permissions
+    DependsOn:
+      - DataFreshnessMonitorRole
+    Properties:
+      DataLakePrincipal:
+        DataLakePrincipalIdentifier: !GetAtt DataFreshnessMonitorRole.Arn
+      Permissions:
+        - DESCRIBE
+      Resource:
+        DatabaseResource:
+          CatalogId: !Ref AWS::AccountId
+          Name: !Ref GlueDatabase
+
+  LakeFormationPermsOnUsersTableForMonitor:
+    Type: AWS::LakeFormation::Permissions
+    DependsOn: LakeFormationPermsOnDBForMonitor
+    Properties:
+      DataLakePrincipal:
+        DataLakePrincipalIdentifier: !GetAtt DataFreshnessMonitorRole.Arn
+      Permissions:
+        - DESCRIBE
+        - SELECT
+      Resource:
+        TableResource:
+          CatalogId: !Ref AWS::AccountId
+          DatabaseName: !Ref GlueDatabase
+          Name: !Ref UsersGlueTable
+
+  LakeFormationPermsOnQueuesTableForMonitor:
+    Type: AWS::LakeFormation::Permissions
+    DependsOn: LakeFormationPermsOnDBForMonitor
+    Properties:
+      DataLakePrincipal:
+        DataLakePrincipalIdentifier: !GetAtt DataFreshnessMonitorRole.Arn
+      Permissions:
+        - DESCRIBE
+        - SELECT
+      Resource:
+        TableResource:
+          CatalogId: !Ref AWS::AccountId
+          DatabaseName: !Ref GlueDatabase
+          Name: !Ref QueuesGlueTable
+
+  # Data Freshness Alarms (Custom Metrics)
+  UsersDataFreshnessAlarm:
+    Type: AWS::CloudWatch::Alarm
+    DependsOn: DataFreshnessMonitorLambda
+    Properties:
+      AlarmName: !Sub '${Environment}-${OPCO}_mappers_users_data_freshness'
+      AlarmDescription: !Sub 'Users mapper data is older than ${DataFreshnessThresholdHours} hours'
+      ActionsEnabled: true
+      AlarmActions:
+        - !If [CreateAlarmFormatter, !Ref SNSTopicArn, !Ref SharedAlarmFormatterTopicArn]
+      OKActions:
+        - !If [CreateAlarmFormatter, !Ref SNSTopicArn, !Ref SharedAlarmFormatterTopicArn]
+      MetricName: UsersDataAgeHours
+      Namespace: !Sub '${Environment}-${OPCO}_MappersPipeline'
+      Statistic: Maximum
+      Dimensions:
+        - Name: TableName
+          Value: users
+        - Name: OPCO
+          Value: !Ref OPCO
+      Period: !Ref DataFreshnessAlarmPeriodSeconds
+      EvaluationPeriods: !Ref DataFreshnessAlarmEvaluationPeriods
+      Threshold: !Ref DataFreshnessThresholdHours
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: breaching
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: OPCO
+          Value: !Ref OPCO
+        - Key: Severity
+          Value: High
+
+  QueuesDataFreshnessAlarm:
+    Type: AWS::CloudWatch::Alarm
+    DependsOn: DataFreshnessMonitorLambda
+    Properties:
+      AlarmName: !Sub '${Environment}-${OPCO}_mappers_queues_data_freshness'
+      AlarmDescription: !Sub 'Queues mapper data is older than ${DataFreshnessThresholdHours} hours'
+      ActionsEnabled: true
+      AlarmActions:
+        - !If [CreateAlarmFormatter, !Ref SNSTopicArn, !Ref SharedAlarmFormatterTopicArn]
+      OKActions:
+        - !If [CreateAlarmFormatter, !Ref SNSTopicArn, !Ref SharedAlarmFormatterTopicArn]
+      MetricName: QueuesDataAgeHours
+      Namespace: !Sub '${Environment}-${OPCO}_MappersPipeline'
+      Statistic: Maximum
+      Dimensions:
+        - Name: TableName
+          Value: queues
+        - Name: OPCO
+          Value: !Ref OPCO
+      Period: 3600
+      EvaluationPeriods: 2
+      Threshold: !Ref DataFreshnessThresholdHours
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: breaching
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: OPCO
+          Value: !Ref OPCO
+        - Key: Severity
+          Value: High
+
+# ==========================================
+# Outputs
+# ==========================================
+Outputs:
+  GlueJobName:
+    Description: Name of the Genesys mappers Glue job
+    Value: !Ref GenesysMappersGlueJob
+    Export:
+      Name: !Sub ${AWS::StackName}-GlueJobName
+
+  GlueJobArn:
+    Description: ARN of the Genesys mappers Glue job
+    Value: !Sub arn:aws:glue:${AWS::Region}:${AWS::AccountId}:job/${GenesysMappersGlueJob}
+    Export:
+      Name: !Sub ${AWS::StackName}-GlueJobArn
+
+  GlueJobRoleArn:
+    Description: ARN of IAM role for Glue job
+    Value: !GetAtt GlueJobRole.Arn
+    Export:
+      Name: !Sub ${AWS::StackName}-GlueJobRoleArn
+
+  GlueTriggerName:
+    Description: Name of Glue trigger scheduling the job
+    Value: !Ref DailyGlueJobTrigger
+    Export:
+      Name: !Sub ${AWS::StackName}-GlueTriggerName
+
+  UsersS3Location:
+    Description: S3 location for users Parquet files
+    Value: !Sub s3://${TargetS3Bucket}/${UsersS3Prefix}/
+    Export:
+      Name: !Sub ${AWS::StackName}-UsersS3Location
+
+  QueuesS3Location:
+    Description: S3 location for queues Parquet files
+    Value: !Sub s3://${TargetS3Bucket}/${QueuesS3Prefix}/
+    Export:
+      Name: !Sub ${AWS::StackName}-QueuesS3Location

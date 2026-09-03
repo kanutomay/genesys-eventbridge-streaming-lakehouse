@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Glue / Spark local artifacts
+.sparkStaging/
+spark-warehouse/
+
+# AWS SAM / CloudFormation build output
+.aws-sam/
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+
+# Local env files — never commit real credentials or account IDs
+.env
+*.pem
+
+# Local safety backups written by scripts/apply_s3_lifecycle.sh before it overwrites a bucket's
+# lifecycle configuration — these are a snapshot of a real bucket's live config, not repo content.
+.lifecycle-backups/
